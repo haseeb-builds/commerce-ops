@@ -11,6 +11,8 @@ import sqlite3
 import uuid
 from datetime import datetime, timezone
 
+from commerceops.timestamps import timestamp_key
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS import_batch (
   id            TEXT PRIMARY KEY,
@@ -198,7 +200,7 @@ def derive_state(conn: sqlite3.Connection, shipment_id: str) -> str:
         return "NEW"
     # Newest = greatest timestamp; identical timestamps (e.g. bulk import)
     # broken by insertion order — the later-inserted event is the newer one.
-    newest = max(events, key=lambda e: (e[2], e[3]))
+    newest = max(events, key=lambda e: (timestamp_key(e[2]), e[3]))
     if newest[0] == "operator_action" and newest[1] in TERMINAL_KINDS:
         return TERMINAL_KINDS[newest[1]]
     return "NEEDS_ACTION" if newest[0] == "tracking_event" else "ACTION_TAKEN"

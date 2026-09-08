@@ -15,9 +15,11 @@ separate enum kind because SPEC's CHECK constraint defines the kinds.
 import hashlib
 import sqlite3
 import uuid
-from datetime import datetime, timedelta
+from datetime import timedelta
+from commerceops.timestamps import timestamp_key
 
 from commerceops.core import utcnow, refresh_state
+from commerceops.transactions import atomic
 
 VALID_ACTION_KINDS = (
     "note", "query_sent", "reattempt_requested", "open_allowed",
@@ -45,17 +47,18 @@ def _next_timestamp(conn, shipment_id: str, requested: str = None) -> str:
     if requested is not None:
         return requested
     candidate = utcnow()
-    row = conn.execute(
-        "SELECT MAX(ts) AS latest FROM ("
+    rows = conn.execute(
+        "SELECT ts FROM ("
         " SELECT acted_at AS ts FROM operator_action WHERE shipment_id=?"
         " UNION ALL SELECT COALESCE(occurred_at, imported_at) AS ts FROM tracking_event WHERE shipment_id=?"
+        " UNION ALL SELECT imported_at AS ts FROM tracking_event WHERE shipment_id=?"
         " UNION ALL SELECT confirmed_at AS ts FROM customer_confirmation WHERE shipment_id=?)",
-        (shipment_id, shipment_id, shipment_id),
-    ).fetchone()
-    latest = row["latest"] if row else None
-    if latest and candidate <= latest:
-        dt = datetime.fromisoformat(latest) + timedelta(microseconds=1)
-        candidate = dt.isoformat()
+        (shipment_id, shipment_id, shipment_id, shipment_id),
+    ).fetchall()
+
+    latest = max((timestamp_key(row["ts"]) for row in rows if row["ts"]), default=None)
+    if latest is not None and timestamp_key(candidate) <= latest:
+        candidate = (latest + timedelta(microseconds=1)).isoformat()
     return candidate
 
 
@@ -78,33 +81,26 @@ def record_operator_action(conn, shipment_id: str, kind: str,
     - other kinds may carry optional free-text note.
     Runs inside a transaction; refreshes current_state via Slice 1 derivation.
     """
-    _check_shipment(conn, shipment_id)
-    if kind not in VALID_ACTION_KINDS:
-        raise ValidationError(
-            f"unknown action kind {kind!r}; valid kinds: {VALID_ACTION_KINDS}"
-        )
-    if kind == "cancel_decided" and not (cancel_reason or "").strip():
-        raise ValidationError("cancel_decided requires non-empty cancel_reason")
-    if kind == "note" and not (note or "").strip():
-        raise ValidationError("operator note requires non-empty note text")
+    with atomic(conn):
+        _check_shipment(conn, shipment_id)
+        if kind not in VALID_ACTION_KINDS:
+            raise ValidationError(
+                f"unknown action kind {kind!r}; valid kinds: {VALID_ACTION_KINDS}"
+            )
+        if kind == "cancel_decided" and not (cancel_reason or "").strip():
+            raise ValidationError("cancel_decided requires non-empty cancel_reason")
+        if kind == "note" and not (note or "").strip():
+            raise ValidationError("operator note requires non-empty note text")
 
-    aid = uuid.uuid4().hex  # uniqueness never depends on clock granularity
-    if conn.in_transaction:
-        conn.commit()  # close any pending implicit transaction before ours
-    acted_at = _next_timestamp(conn, shipment_id, acted_at)
-    try:
-        conn.execute("BEGIN")
+        aid = uuid.uuid4().hex  # uniqueness never depends on clock granularity
+        acted_at = _next_timestamp(conn, shipment_id, acted_at)
         conn.execute(
             "INSERT INTO operator_action (id, shipment_id, kind, note, cancel_reason, actor, acted_at)"
             " VALUES (?,?,?,?,?,?,?)",
             (aid, shipment_id, kind, note, cancel_reason, actor, acted_at),
         )
         refresh_state(conn, shipment_id)
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    return aid
+        return aid
 
 
 def record_customer_confirmation(conn, shipment_id: str, content: str,
@@ -112,26 +108,19 @@ def record_customer_confirmation(conn, shipment_id: str, content: str,
     """Append one CustomerConfirmation record — what the customer REPORTED,
     entered verbatim by the operator. Never generated, never auto-verified;
     the timeline labels it CUSTOMER CONFIRMED per SPEC §F."""
-    _check_shipment(conn, shipment_id)
-    if not (content or "").strip():
-        raise ValidationError("customer confirmation requires non-empty content")
-    cid = uuid.uuid4().hex  # uniqueness never depends on clock granularity
-    if conn.in_transaction:
-        conn.commit()  # close any pending implicit transaction before ours
-    confirmed_at = _next_timestamp(conn, shipment_id, confirmed_at)
-    try:
-        conn.execute("BEGIN")
+    with atomic(conn):
+        _check_shipment(conn, shipment_id)
+        if not (content or "").strip():
+            raise ValidationError("customer confirmation requires non-empty content")
+        cid = uuid.uuid4().hex  # uniqueness never depends on clock granularity
+        confirmed_at = _next_timestamp(conn, shipment_id, confirmed_at)
         conn.execute(
             "INSERT INTO customer_confirmation (id, shipment_id, channel, content, confirmed_at)"
             " VALUES (?,?,?,?,?)",
             (cid, shipment_id, channel, content, confirmed_at),
         )
         refresh_state(conn, shipment_id)
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    return cid
+        return cid
 
 
 def list_operator_actions(conn, shipment_id: str):

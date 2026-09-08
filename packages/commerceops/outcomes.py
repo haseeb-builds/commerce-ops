@@ -14,6 +14,7 @@ Part B: thin domain APIs over the EXISTING operator_action kinds
 derivation. No new states, no new rules.
 """
 import sqlite3
+from commerceops.timestamps import timestamp_key
 
 from commerceops.core import utcnow, refresh_state, derive_state
 from commerceops.actions import (
@@ -64,14 +65,15 @@ def _validate_terminal_timestamp(conn, shipment_id: str, acted_at: str, label: s
     if acted_at is None:
         return  # API default = now; _next_timestamp guarantees monotonicity
     from commerceops.core import derive_state
-    latest = conn.execute(
-        "SELECT MAX(ts) AS m FROM ("
+    timestamps = conn.execute(
+        "SELECT ts FROM ("
         " SELECT acted_at AS ts FROM operator_action WHERE shipment_id=?"
         " UNION ALL SELECT COALESCE(occurred_at, imported_at) FROM tracking_event WHERE shipment_id=?"
         " UNION ALL SELECT confirmed_at FROM customer_confirmation WHERE shipment_id=?)",
         (shipment_id, shipment_id, shipment_id),
-    ).fetchone()["m"]
-    if latest is not None and acted_at < latest:
+    ).fetchall()
+    latest = max((row["ts"] for row in timestamps), key=timestamp_key, default=None)
+    if latest is not None and timestamp_key(acted_at) < timestamp_key(latest):
         raise ValidationError(
             f"{label} rejected: supplied acted_at {acted_at!r} predates a newer "
             f"event ({latest!r}); the terminal outcome would not take effect. "

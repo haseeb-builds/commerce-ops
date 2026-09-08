@@ -5,6 +5,7 @@ interpretation, no AI. Every timeline entry carries an explicit source label
 so courier claims are never presented as customer truth (SPEC §F).
 """
 from datetime import datetime
+from commerceops.timestamps import timestamp_key
 
 # Epistemic labels per SPEC §F — display-only, never stored back.
 SOURCE_LABELS = {
@@ -37,7 +38,7 @@ def get_shipment_by_tracking(conn, tracking_no: str):
 def _sort_key(entry):
     """Same deterministic semantics as Slice 1 derive_state:
     timestamp first, insertion order (rowid) as tie-break."""
-    return (entry["at"], entry["ord"])
+    return (timestamp_key(entry["at"]), entry["ord"])
 
 
 def build_timeline(conn, shipment_id: str):

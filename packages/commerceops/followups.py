@@ -15,6 +15,7 @@ import sqlite3
 import uuid
 
 from commerceops.core import utcnow, refresh_state
+from commerceops.transactions import atomic
 from commerceops.actions import (
     ShipmentNotFoundError, ValidationError, _check_shipment, _next_timestamp,
 )
@@ -28,53 +29,39 @@ class FollowUpNotFoundError(Exception):
 
 def create_follow_up(conn, shipment_id: str, due_at: str, reason: str):
     """Create one human-set follow-up. Append-only; duplicates preserved."""
-    _check_shipment(conn, shipment_id)
-    if not (due_at or "").strip():
-        raise ValidationError("follow-up requires a due_at (human-set)")
-    if not (reason or "").strip():
-        raise ValidationError("follow-up requires a non-empty reason")
-    fid = uuid.uuid4().hex  # uniqueness never depends on clock granularity
-    if conn.in_transaction:
-        conn.commit()  # close any pending implicit transaction before ours
-    try:
-        conn.execute("BEGIN")
+    with atomic(conn):
+        _check_shipment(conn, shipment_id)
+        if not (due_at or "").strip():
+            raise ValidationError("follow-up requires a due_at (human-set)")
+        if not (reason or "").strip():
+            raise ValidationError("follow-up requires a non-empty reason")
+        fid = uuid.uuid4().hex  # uniqueness never depends on clock granularity
         conn.execute(
             "INSERT INTO follow_up (id, shipment_id, reason, due_at, status, created_at)"
             " VALUES (?,?,?,?, 'open', ?)",
             (fid, shipment_id, reason, due_at, utcnow()),
         )
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    return fid
+        return fid
 
 
-def complete_follow_up(conn, follow_up_id: str):
+def complete_follow_up(conn, follow_up_id: str, *, completed_at: str = None):
     """Mark one follow-up done. Rejects already-closed follow-ups rather than
     rewriting history. Original values remain untouched."""
-    row = conn.execute(
-        "SELECT * FROM follow_up WHERE id=?", (follow_up_id,)
-    ).fetchone()
-    if row is None:
-        raise FollowUpNotFoundError(f"no follow-up with id {follow_up_id!r}")
-    if row["status"] != "open":
-        raise ValidationError(
-            f"follow-up {follow_up_id!r} is already {row['status']}; cannot complete twice"
-        )
-    if conn.in_transaction:
-        conn.commit()
-    try:
-        conn.execute("BEGIN")
+    with atomic(conn):
+        row = conn.execute(
+            "SELECT * FROM follow_up WHERE id=?", (follow_up_id,)
+        ).fetchone()
+        if row is None:
+            raise FollowUpNotFoundError(f"no follow-up with id {follow_up_id!r}")
+        if row["status"] != "open":
+            raise ValidationError(
+                f"follow-up {follow_up_id!r} is already {row['status']}; cannot complete twice"
+            )
         conn.execute(
             "UPDATE follow_up SET status='done', closed_at=? WHERE id=?",
-            (utcnow(), follow_up_id),
+            (completed_at or utcnow(), follow_up_id),
         )
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    return row  # pre-update record returned for reference
+        return row  # pre-update record returned for reference
 
 
 def list_follow_ups(conn, shipment_id: str = None, now: str = None):

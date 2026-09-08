@@ -9,6 +9,7 @@ Launch:  python -m commerceops_ui.run   (from repository root)
 """
 import os
 import sys
+from urllib.parse import urlencode
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
@@ -245,73 +246,80 @@ def pending_tasks(request: Request):
     try:
         pending_tasks = operational.get_pending_human_tasks_with_context(conn)
         return templates.TemplateResponse(request, "pending_tasks.html", {
-            "pending_tasks": pending_tasks
+            "pending_tasks": pending_tasks,
+            **{key: request.query_params.get(key, "") for key in
+               ("error", "next_disposition", "next_capability", "next_reason")},
         })
     finally:
         conn.close()
 
 
-@app.post("/tasks/{task_id}/complete")
-def complete_task(task_id: str, 
-                  completion_result: str = Form(""),
-                  completion_method: str = Form("")):
-    """Complete a human task with the provided result.
-    
-    Expected form data:
-    - completion_result: JSON string containing the completion details
-    - completion_method: For VERIFY_CUSTOMER: verification method (phone, email, etc.)
-                        For DECIDE_ACTION: decision type 
-                        For FOLLOW_UP_ACTION: completion notes
-    """
-    from commerceops import operational
-    import json
-    
+@app.post("/shipment/{tracking_no}/evaluate")
+def evaluate_shipment(tracking_no: str):
+    """Explicit command, never a side effect of reading the work queue."""
+    from commerceops import case_engine
     conn = _conn()
-    err = None
-    next_evaluation = None
-    evidence_recorded = None
-    
     try:
-        # Parse completion result
-        try:
-            result_data = json.loads(completion_result) if completion_result.strip() else {}
-        except json.JSONDecodeError:
-            result_data = {"raw_input": completion_result}
-        
-        # Add method-specific data
-        if completion_method:
-            if completion_method not in result_data:
-                result_data["method"] = completion_method
-        
-        # Complete the task
-        completion_result_dict = operational.complete_human_task_with_evidence(
-            conn, task_id, result_data
-        )
-        
-        if not completion_result_dict["success"]:
-            err = completion_result_dict["error"]
-        else:
-            next_evaluation = completion_result_dict["next_evaluation"]
-            evidence_recorded = completion_result_dict["evidence_recorded"]
-            
-    except Exception as e:
-        err = str(e)
+        row = conn.execute("SELECT id FROM shipment WHERE tracking_no=?", (tracking_no,)).fetchone()
+        if row is None:
+            raise actions.ShipmentNotFoundError("unknown shipment")
+        result = case_engine.evaluate_shipment(conn, row["id"])
+        params = {"next_disposition": result.disposition,
+                  "next_capability": result.capability or "", "next_reason": result.reason}
+    except (ValueError, actions.ShipmentNotFoundError) as exc:
+        params = {"error": str(exc)}
     finally:
         conn.close()
-    
-    # Redirect back to task list with results
-    dest = f"/tasks/pending"
-    if err:
-        dest += f"?error={err}"
-    elif next_evaluation is not None:
-        # Include evaluation results in redirect for display
-        dest += f"?next_disposition={next_evaluation.disposition}"
-        if next_evaluation.capability:
-            dest += f"&next_capability={next_evaluation.capability}"
-        if next_evaluation.reason:
-            dest += f"&next_reason={next_evaluation.reason}"
-    
-    return RedirectResponse(dest, status_code=303)
+    return RedirectResponse("/tasks/pending?" + urlencode(params), status_code=303)
+
+
+@app.post("/tasks/{task_id}/complete")
+def complete_task(task_id: str,
+                  completion_result: str = Form(""),
+                  completion_method: str = Form(""),
+                  customer_response: str = Form(""),
+                  verification_method: str = Form(""),
+                  decision_type: str = Form(""),
+                  notes: str = Form(""),
+                  cancel_reason: str = Form(""),
+                  confirm_cancel: str = Form(""),
+                  completion_notes: str = Form("")):
+    """Typed operator forms, retaining the existing JSON submission interface."""
+    from commerceops import operational, human_task
+    import json
+
+    conn = _conn()
+    try:
+        task = human_task.get_human_task(conn, task_id)
+        if task is None:
+            raise ValueError(f"Human task not found: {task_id}")
+        if completion_result.strip():
+            result_data = json.loads(completion_result)
+            if not isinstance(result_data, dict):
+                raise actions.ValidationError("completion_result must be an object")
+        elif task["type"] == "VERIFY_CUSTOMER":
+            result_data = {"customer_response": customer_response,
+                           "verification_method": verification_method or completion_method or "unknown"}
+        elif task["type"] == "DECIDE_ACTION":
+            if decision_type == "cancel_decided" and confirm_cancel != "yes":
+                raise actions.ValidationError("Explicit cancellation confirmation is required")
+            result_data = {"decision_type": decision_type, "notes": notes, "cancel_reason": cancel_reason}
+        else:
+            result_data = {"completion_notes": completion_notes}
+        if task["type"] == "VERIFY_CUSTOMER" and completion_method:
+            result_data.setdefault("verification_method", completion_method)
+        result = operational.complete_human_task_with_evidence(conn, task_id, result_data)
+        if not result["success"]:
+            params = {"error": result["error"]}
+        else:
+            evaluation = result["next_evaluation"]
+            params = {"next_disposition": evaluation.disposition,
+                      "next_capability": evaluation.capability or "", "next_reason": evaluation.reason}
+    except (ValueError, actions.ValidationError) as exc:
+        params = {"error": str(exc)}
+    finally:
+        conn.close()
+    return RedirectResponse("/tasks/pending?" + urlencode(params), status_code=303)
 
 
 @app.get("/task/{task_id}", response_class=HTMLResponse)

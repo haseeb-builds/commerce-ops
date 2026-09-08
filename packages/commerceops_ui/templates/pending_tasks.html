@@ -4,7 +4,7 @@
 </head><body>
 <h1>Pending Human Tasks</h1>
 {% if error %}<p class="err">Error: {{ error }}</p>{% endif %}
-{% if next_disposition %}<p class="meta">Last completion: next disposition <span class="pill">{{ next_disposition }}</span>{% if next_capability %} / capability {{ next_capability }}{% endif %}{% if next_reason %} &mdash; {{ next_reason }}{% endif %}</p>{% endif %}
+{% if next_disposition %}<p class="meta">Last evaluation: next disposition <span class="pill">{{ next_disposition }}</span>{% if next_capability %} / capability {{ next_capability }}{% endif %}{% if next_reason %} &mdash; {{ next_reason }}{% endif %}</p>{% endif %}
 {% if not pending_tasks %}<p>No pending human tasks.</p>
 {% else %}
 <table>
@@ -14,14 +14,13 @@
 <tr>
   <td><a href="/task/{{ t.id }}">{{ t.id[:12] }}…</a></td>
   <td>{{ t.type }}</td>
-  <td>{{ t.case_info.tracking_no or '—' }}</td>
+  <td><a href="/shipment/{{ t.case_info.tracking_no }}">{{ t.case_info.tracking_no or "—" }}</a></td>
   <td>{{ t.case_info.case_id[:12] }}…</td>
   <td>{{ t.status }}</td>
   <td>
-    <form method="post" action="/tasks/{{ t.id }}/complete" style="display:inline">
-      <input type="hidden" name="completion_result" value='{"customer_response":"Verified"}'>
-      <input type="hidden" name="completion_method" value="whatsapp">
-      <button type="submit">Complete (verify)</button>
+    <a href="/task/{{ t.id }}">Review evidence and complete</a>
+    <form method="post" action="/shipment/{{ t.case_info.tracking_no }}/evaluate">
+      <button type="submit">Re-evaluate evidence</button>
     </form>
   </td>
 </tr>

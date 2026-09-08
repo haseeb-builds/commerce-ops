@@ -1,0 +1,7 @@
+# Runtime dependencies verified for the existing local FastAPI UI.
+fastapi==0.141.1
+starlette==1.6.0
+Jinja2==3.1.6
+python-multipart==0.0.32
+uvicorn==0.52.4
+anyio==4.15.1

@@ -27,6 +27,7 @@ from commerceops import capability
 from commerceops import actions
 from commerceops import followups
 from commerceops.actions import ValidationError
+from commerceops.transactions import atomic
 
 
 def get_pending_human_tasks_with_context(
@@ -163,90 +164,71 @@ def complete_human_task_with_evidence(
         ValueError: For invalid task IDs or unsupported task types
         ValidationError: For invalid completion data
     """
-    # Start transaction for atomicity
-    need_to_commit = not conn.in_transaction
-    if need_to_commit:
-        conn.execute("BEGIN")
-    
+    case_id = None
     try:
-        # Step 1: Validate task exists and is completable
-        task = human_task.get_human_task(conn, task_id)
-        if task is None:
-            raise ValueError(f"Human task not found: {task_id}")
-            
-        if task["status"] != "PENDING":
-            raise ValidationError(
-                f"Human task {task_id} is not PENDING (current status: {task['status']})"
-            )
-        
-        case_id = task["case_id"]
-        task_type = task["type"]
-        original_payload = task["payload"] if task["payload"] else {}
-        
-        # Step 2: Get case information for re-evaluation
-        case_obj = case.get_case(conn, case_id)
-        if case_obj is None:
-            raise ValueError(f"Case not found for task: {case_id}")
-        
-        shipment_id = case_obj["shipment_id"]
-        
-        # Step 3: Perform the capability operation and record evidence
-        evidence_recorded = {}
-        
-        if task_type == "VERIFY_CUSTOMER":
-            evidence_recorded = _handle_verify_customer_completion(
-                conn, case_id, shipment_id, completion_result
-            )
-        elif task_type == "DECIDE_ACTION":
-            evidence_recorded = _handle_decide_action_completion(
-                conn, case_id, shipment_id, completion_result
-            )
-        elif task_type == "FOLLOW_UP_ACTION":
-            evidence_recorded = _handle_follow_up_action_completion(
-                conn, case_id, shipment_id, completion_result
-            )
-        else:
-            raise ValueError(f"Unsupported task type: {task_type}")
-        
-        # Step 4: Mark the human task as completed
-        # Include the evidence record in the task payload for audit trail
-        completion_payload = {
-            **original_payload,
-            "completion_result": completion_result,
-            "evidence_recorded": evidence_recorded
-        }
-        human_task.complete_human_task(conn, task_id, completion_payload)
-        
-        # Step 5: Trigger case re-evaluation
-        next_evaluation = case_engine.evaluate_case(conn, case_id)
-        
-        # Step 6: Commit transaction
-        if need_to_commit:
-            conn.commit()
-        
-        # Return success information
+        with atomic(conn):
+            if not isinstance(completion_result, dict):
+                raise ValidationError("completion_result must be an object")
+            task = human_task.get_human_task(conn, task_id)
+            if task is None:
+                raise ValueError(f"Human task not found: {task_id}")
+            if task["status"] != "PENDING":
+                raise ValidationError(
+                    f"Human task {task_id} is not PENDING (current status: {task['status']})")
+            case_id = task["case_id"]
+            case_obj, evidence, _, assessment = case_engine.assess_case(conn, case_id)
+            if case_obj["status"] != "OPEN":
+                raise ValidationError("Case is not OPEN; re-evaluate before completing work")
+            task_type = task["type"]
+            original_payload = task["payload"] or {}
+            if task_type in {"VERIFY_CUSTOMER", "DECIDE_ACTION"}:
+                if not case_engine.task_matches_work(task, assessment):
+                    raise ValidationError("Task is stale for current evidence; re-evaluate the shipment")
+                # Bind legacy tasks on successful completion, retaining their other data.
+                original_payload = {**original_payload, "evidence_ids": assessment["work_evidence_ids"]}
+                _validate_completion_timestamp(task_type, completion_result, evidence,
+                                               assessment["work_evidence_ids"])
+            shipment_id = case_obj["shipment_id"]
+            if task_type == "VERIFY_CUSTOMER":
+                evidence_recorded = _handle_verify_customer_completion(
+                    conn, case_id, shipment_id, completion_result)
+            elif task_type == "DECIDE_ACTION":
+                evidence_recorded = _handle_decide_action_completion(
+                    conn, case_id, shipment_id, completion_result)
+            elif task_type == "FOLLOW_UP_ACTION":
+                evidence_recorded = _handle_follow_up_action_completion(
+                    conn, case_id, shipment_id,
+                    {**completion_result, "original_task_payload": original_payload})
+            else:
+                raise ValueError(f"Unsupported task type: {task_type}")
+            human_task.complete_human_task(conn, task_id, {
+                **original_payload, "completion_result": completion_result,
+                "evidence_recorded": evidence_recorded,
+            })
+            next_evaluation = case_engine.evaluate_case(conn, case_id)
         return {
-            "success": True,
-            "task_id": task_id,
-            "case_id": case_id,
-            "next_evaluation": next_evaluation,
-            "evidence_recorded": evidence_recorded,
-            "error": None
+            "success": True, "task_id": task_id, "case_id": case_id,
+            "next_evaluation": next_evaluation, "evidence_recorded": evidence_recorded,
+            "error": None,
         }
-        
-    except Exception as e:
-        # Rollback on any error
-        if need_to_commit:
-            conn.rollback()
-        
+    except Exception as exc:
         return {
-            "success": False,
-            "task_id": task_id if 'task_id' in locals() else None,
-            "case_id": case_id if 'case_id' in locals() else None,
-            "next_evaluation": None,
-            "evidence_recorded": None,
-            "error": str(e)
+            "success": False, "task_id": task_id, "case_id": case_id,
+            "next_evaluation": None, "evidence_recorded": None, "error": str(exc),
         }
+
+
+def _validate_completion_timestamp(task_type, result, evidence, basis):
+    """A response/decision cannot complete work based on evidence it predates."""
+    from commerceops.policy import Evidence, evidence_timestamp
+    field = "verified_at" if task_type == "VERIFY_CUSTOMER" else "decided_at"
+    value = result.get(field)
+    if value is None:
+        return
+    timestamp = evidence_timestamp(Evidence("completion", "operator_action", {"acted_at": value}))
+    latest = max(evidence_timestamp(e) for e in evidence if e.id in basis)
+    if timestamp <= latest:
+        raise ValidationError(f"{field} must be later than the task's evidence")
 
 
 def _handle_verify_customer_completion(
@@ -262,10 +244,10 @@ def _handle_verify_customer_completion(
     """
     # Extract verification details
     verification_method = completion_result.get("verification_method", "unknown")
-    customer_response = completion_result.get("customer_response", "").strip()
+    customer_response = completion_result.get("customer_response", "")
     verified_at = completion_result.get("verified_at")
     
-    if not customer_response:
+    if not isinstance(customer_response, str) or not customer_response.strip():
         raise ValidationError("VERIFY_CUSTOMER completion requires non-empty customer_response")
     
     # Use provided timestamp or generate next valid timestamp
@@ -307,18 +289,18 @@ def _handle_decide_action_completion(
     """
     # Extract decision details
     decision_type = completion_result.get("decision_type", "").strip()
-    notes = completion_result.get("notes", "").strip()
+    notes = completion_result.get("notes", "")
     decided_at = completion_result.get("decided_at")
     
     if not decision_type:
         raise ValidationError("DECIDE_ACTION completion requires non-empty decision_type")
     
-    # Validate decision type is a valid operator action kind
-    from commerceops.actions import VALID_ACTION_KINDS
-    if decision_type not in VALID_ACTION_KINDS:
+    # A note/query is valid evidence, but cannot discharge a decision task.
+    from commerceops.policy import DECISION_KINDS
+    if decision_type not in DECISION_KINDS:
         raise ValidationError(
             f"Invalid decision_type '{decision_type}'. "
-            f"Valid kinds: {', '.join(VALID_ACTION_KINDS)}"
+            f"Valid decision kinds: {', '.join(sorted(DECISION_KINDS))}"
         )
     
     # Use provided timestamp or generate next valid timestamp
@@ -334,6 +316,8 @@ def _handle_decide_action_completion(
         shipment_id,
         decision_type,
         note=notes if notes else None,
+        cancel_reason=completion_result.get("cancel_reason"),
+        actor=completion_result.get("actor", "laiba"),
         acted_at=acted_at
     )
     
@@ -369,13 +353,17 @@ def _handle_follow_up_action_completion(
     if not follow_up_id:
         raise ValidationError("FOLLOW_UP_ACTION completion requires follow_up_id in original task payload")
     
+    row = conn.execute("SELECT shipment_id FROM follow_up WHERE id=?", (follow_up_id,)).fetchone()
+    if row is None or row["shipment_id"] != shipment_id:
+        raise ValidationError("Follow-up does not belong to this task's shipment")
+
     # Use provided timestamp or current time
     if completed_at is None:
         from commerceops.core import utcnow
         completed_at = utcnow()
     
     # Complete the follow-up (authoritative evidence)
-    followup_row = followups.complete_follow_up(conn, follow_up_id)
+    followup_row = followups.complete_follow_up(conn, follow_up_id, completed_at=completed_at)
     
     return {
         "type": "follow_up_completion",

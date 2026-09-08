@@ -176,3 +176,20 @@ def get_pending_tasks(conn) -> List[dict]:
         task["payload"] = json.loads(task["payload"]) if task["payload"] else None
         tasks.append(task)
     return tasks
+
+def supersede_human_task(conn, task_id: str, *, reason: str,
+                         evidence_ids: List[str], replacement_task_id: Optional[str]) -> None:
+    """Cancel obsolete work with a retained explanation and replacement reference."""
+    task = get_human_task(conn, task_id)
+    if task is None or task["status"] not in {"PENDING", "IN_PROGRESS"}:
+        return
+    now = utcnow()
+    payload = {**(task["payload"] or {}), "superseded": {
+        "reason": reason, "evidence_ids": evidence_ids,
+        "replacement_task_id": replacement_task_id, "at": now,
+    }}
+    conn.execute(
+        "UPDATE human_task SET status='CANCELLED', payload=?, updated_at=?, completed_at=? "
+        "WHERE id=? AND status IN ('PENDING', 'IN_PROGRESS')",
+        (json.dumps(payload), now, now, task_id),
+    )

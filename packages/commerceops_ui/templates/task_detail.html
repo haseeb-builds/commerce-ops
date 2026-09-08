@@ -10,27 +10,47 @@
 {% if task.status == "PENDING" %}
 {% if task.type == "VERIFY_CUSTOMER" %}
 <form method="post" action="/tasks/{{ task.id }}/complete">
-  <input type="hidden" name="completion_method" value="whatsapp">
-  <label>Customer response:<br><textarea name="completion_result" rows="3" cols="60">{"customer_response":"I did not refuse"}</textarea></label><br><br>
-  <button type="submit">Submit verification</button>
+  <label>Contact method: <input name="verification_method" placeholder="call / whatsapp" required></label><br><br>
+  <label>Customer's exact response:<br><textarea name="customer_response" rows="4" cols="60" required></textarea></label><br><br>
+  <p class="meta">Record only what the customer said. This does not establish whether the courier's claim is true.</p>
+  <button type="submit">Record customer response</button>
 </form>
 {% elif task.type == "DECIDE_ACTION" %}
 <form method="post" action="/tasks/{{ task.id }}/complete">
-  <input type="hidden" name="completion_method" value="reattempt_requested">
-  <label>Decision payload (JSON):<br><textarea name="completion_result" rows="3" cols="60">{"decision_type":"reattempt_requested","notes":"Customer denied refusal"}</textarea></label><br><br>
-  <button type="submit">Submit decision</button>
+  <label>Operator decision:
+    <select name="decision_type" required>
+      <option value="">Choose a decision</option>
+      <option value="reattempt_requested">Reattempt requested</option>
+      <option value="cancel_decided">Cancel decided</option>
+      <option value="delivered_confirmed">Delivery confirmed by operator</option>
+      <option value="returned_confirmed">Return confirmed by operator</option>
+    </select>
+  </label><br><br>
+  <label>Reasoning / notes:<br><textarea name="notes" rows="3" cols="60"></textarea></label><br><br>
+  <label>Cancellation reason (required for cancel): <input name="cancel_reason"></label><br>
+  <label><input type="checkbox" name="confirm_cancel" value="yes"> I explicitly confirm cancellation if selected above.</label><br><br>
+  <p class="meta">Recording a decision does not send a courier request.</p>
+  <button type="submit">Record operator decision</button>
 </form>
 {% else %}
 <form method="post" action="/tasks/{{ task.id }}/complete">
-  <label>Completion payload (JSON):<br><textarea name="completion_result" rows="3" cols="60">{"completion_notes":"done"}</textarea></label><br><br>
-  <button type="submit">Submit</button>
+  <label>Completion notes:<br><textarea name="completion_notes" rows="3" cols="60" required></textarea></label><br><br>
+  <button type="submit">Record follow-up completion</button>
 </form>
 {% endif %}
 {% else %}
 <p class="meta">This task is {{ task.status }} and cannot be completed again.</p>
 {% endif %}
 
-<h2>Original payload</h2>
+{% if task.payload and task.payload.superseded %}
+<h2>Why this task was retired</h2>
+<p>{{ task.payload.superseded.reason }}</p>
+{% if task.payload.superseded.replacement_task_id %}
+<p><a href="/task/{{ task.payload.superseded.replacement_task_id }}">Open replacement task</a></p>
+{% endif %}
+{% endif %}
+
+<h2>Evidence references and task audit</h2>
 <pre>{{ (task.payload or {}) | tojson(indent=2) }}</pre>
 
 <p><a href="/tasks/pending">← back to pending tasks</a></p>

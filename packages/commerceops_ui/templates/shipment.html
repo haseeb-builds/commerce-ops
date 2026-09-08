@@ -26,6 +26,12 @@ State: <span class="state">{{ d.derived_state }}</span>
 | Phone: {{ d.customer_phone or 'not provided' }}
 </p>
 
+<h2>Case work</h2>
+<form method="post" action="/shipment/{{ d.tracking_no }}/evaluate">
+ <button type="submit">Evaluate current evidence</button>
+</form>
+<p>Creates or reuses this shipment's Case and retires obsolete work. <a href="/tasks/pending">Pending human tasks</a></p>
+
 <h2>Timeline</h2>
 <ol class="timeline">
 {% for e in d.timeline %}
