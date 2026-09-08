@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Import Shipments</title>
+<style>
+ body{font-family:consolas,monospace;max-width:1100px;margin:2rem auto;padding:0 1rem;background:#111;color:#ddd}
+ textarea{width:100%;height:300px;background:#000;color:#ddd;border:1px solid #444;font-family:inherit}
+ .counts span{margin-right:1rem;background:#333;padding:.15rem .5rem;border-radius:3px}
+ table{border-collapse:collapse;width:100%;margin-top:1rem}
+ td,th{border:1px solid #444;padding:.3rem .5rem;text-align:left}
+ .q{color:#f96}
+</style></head>
+<body>
+<h1>Import Shipments</h1>
+<p>Paste the operator CSV (<code>tracking_no, postex_remark [, our_remark] [, status]</code>). Header optional.</p>
+<form method="post" action="/import">
+<textarea name="pasted" placeholder="29221080025518,RFD,(REATTEMPT)&#10;...">{{ pasted }}</textarea>
+<br><button type="submit">Import</button> <a href="/">back to queue</a>
+</form>
+
+{% if result %}
+<h2>Import result</h2>
+<div class="counts">
+ <span>rows parsed: {{ result.rows_parsed }}</span>
+ <span>new shipments: {{ result.shipments_created }}</span>
+ <span>courier observations: {{ result.events_created }}</span>
+ <span>operator records from legacy columns: {{ result.actions_created }}</span>
+ <span>duplicates skipped: {{ result.duplicates }}</span>
+ <span class="q">quarantined: {{ result.quarantined }}</span>
+</div>
+{% if quarantined_rows %}
+<h3>Quarantined lines (nothing lost — fix and re-paste)</h3>
+<table><tr><th>Line #</th><th>Original text</th><th>Reason</th></tr>
+{% for q in quarantined_rows %}
+<tr><td>{{ q.line_no }}</td><td>{{ q.line_text }}</td><td class="q">{{ q.reason }}</td></tr>
+{% endfor %}
+</table>
+{% endif %}
+<p><a href="/">Go to work queue →</a></p>
+{% endif %}
+</body></html>

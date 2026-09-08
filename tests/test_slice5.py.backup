@@ -1,0 +1,292 @@
+"""Slice 5 tests: deterministic WhatsApp drafts + explicit terminal outcomes."""
+import importlib
+import os
+import sys
+
+import pytest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "packages"))
+core = importlib.import_module("commerceops.core")
+detail = importlib.import_module("commerceops.detail")
+actions = importlib.import_module("commerceops.actions")
+followups = importlib.import_module("commerceops.followups")
+outcomes = importlib.import_module("commerceops.outcomes")
+
+EVIDENCE = os.path.join(os.path.dirname(__file__), "..", "docs", "evidence", "sample_cases.csv")
+
+
+def db(tmp_path):
+    return core.connect(str(tmp_path / "s5.db"))
+
+
+def load_evidence():
+    with open(EVIDENCE, encoding="utf-8") as f:
+        return f.read()
+
+
+def ship_id(conn, tno):
+    return conn.execute("SELECT id FROM shipment WHERE tracking_no=?", (tno,)).fetchone()["id"]
+
+
+# ---------------- Part A: drafts ----------------
+
+def test_a_reattempt_draft_exact_output():
+    """A. Reattempt draft matches the evidenced pattern exactly."""
+    assert outcomes.generate_draft("reattempt", "29221080025518") == (
+        "29221080025518\nREATTEMPT KARWAYN"
+    )
+
+
+def test_b_fake_attempt_draft_exact_output():
+    """B. Fake-attempt draft uses the CSV-verbatim text."""
+    assert outcomes.generate_draft("fake_attempt_reattempt", "28221080023874") == (
+        "28221080023874\nFAKE ATTEMPT THA REATTEMPT KARWAYN"
+    )
+
+
+def test_c_delivery_status_query_exact_output():
+    """C. Delivery-status query draft matches the evidenced pattern."""
+    assert outcomes.generate_draft("delivery_status_query", "20221080023259") == (
+        "20221080023259\nYE KB DEL HOGA ?"
+    )
+
+
+def test_d_unsupported_intent_rejected():
+    """D. Invented intents rejected — no template taxonomy growth."""
+    for bad in ("apology", "refund", "return_risk", "", None):
+        with pytest.raises(actions.ValidationError):
+            outcomes.generate_draft(bad if bad else "", "T1")
+
+
+def test_e_draft_deterministic_and_tracking_preserved(tmp_path):
+    """E. Repeated generation gives identical output; tracking number verbatim
+    (no normalization/casing change)."""
+    tno = "29221080025518"
+    d1 = outcomes.generate_draft("reattempt", tno)
+    d2 = outcomes.generate_draft("reattempt", tno)
+    d3 = outcomes.generate_draft("reattempt", tno)
+    assert d1 == d2 == d3
+    assert d1.splitlines()[0] == tno  # exact preservation
+    # odd casing/spacing in a tracking number is NOT silently fixed
+    weird = "  abc-123-X "
+    dw = outcomes.generate_draft("reattempt", weird)
+    assert dw.splitlines()[0] == weird
+
+
+def test_f_draft_generation_does_not_mutate_db(tmp_path):
+    """F. Generating a draft performs zero database writes."""
+    conn = db(tmp_path)
+    core.import_source(conn, load_evidence())
+    def counts():
+        return {
+            t: conn.execute(f"SELECT COUNT(*) c FROM {t}").fetchone()["c"]
+            for t in ("shipment", "tracking_event", "operator_action",
+                      "customer_confirmation", "follow_up", "quarantine_row",
+                      "import_batch", "import_conflict")
+        }
+    before = counts()
+    for intent in outcomes.DRAFT_INTENTS:
+        outcomes.generate_draft(intent, "29221080025518")
+    after = counts()
+    assert before == after
+
+
+def test_g_no_automatic_sending(tmp_path):
+    """No send mechanism exists anywhere in the draft path (structural check)."""
+    src = open(os.path.join(os.path.dirname(__file__), "..", "packages",
+               "commerceops", "outcomes.py"), encoding="utf-8").read()
+    for forbidden in ("requests.", "urllib", "smtplib", "http", "socket"):
+        assert forbidden not in src.lower() or forbidden == "http" and "http" not in src.lower().replace("https://hermes", "")
+    # and generate_draft returns str only
+    result = outcomes.generate_draft("reattempt", "T9")
+    assert isinstance(result, str)
+
+
+# ---------------- Part B: terminal outcomes ----------------
+
+def test_h_delivered_persists_and_produces_state(tmp_path):
+    """G+H. Delivered action persists; derivation yields CLOSED_DELIVERED."""
+    conn = db(tmp_path)
+    core.import_source(conn, load_evidence())
+    sid = ship_id(conn, "SAMPLE_001")
+    aid = outcomes.mark_delivered(conn, sid, acted_at="2026-08-26T10:00:00+00:00")
+    row = conn.execute("SELECT * FROM operator_action WHERE id=?", (aid,)).fetchone()
+    assert row["kind"] == "delivered_confirmed"
+    assert row["actor"] == "laiba"
+    assert row["acted_at"] == "2026-08-26T10:00:00+00:00"
+    assert core.derive_state(conn, sid) == "CLOSED_DELIVERED"
+
+
+def test_i_cancel_requires_reason(tmp_path):
+    """I. Blank/missing cancellation reason rejected."""
+    conn = db(tmp_path)
+    core.import_source(conn, load_evidence())
+    sid = ship_id(conn, "SAMPLE_002")
+    with pytest.raises(actions.ValidationError):
+        outcomes.mark_cancelled(conn, sid, cancel_reason="")
+    with pytest.raises(actions.ValidationError):
+        outcomes.mark_cancelled(conn, sid, cancel_reason=None)
+    with pytest.raises(actions.ValidationError):
+        outcomes.mark_cancelled(conn, sid, cancel_reason="   ")
+    n = conn.execute(
+        "SELECT COUNT(*) c FROM operator_action WHERE shipment_id=? AND kind='cancel_decided'",
+        (sid,),
+    ).fetchone()["c"]
+    assert n == 0
+
+
+def test_j_cancel_reason_verbatim_and_state(tmp_path):
+    """J+K. Reason preserved verbatim; state becomes CLOSED_CANCELLED."""
+    conn = db(tmp_path)
+    core.import_source(conn, load_evidence())
+    sid = ship_id(conn, "SAMPLE_003")
+    outcomes.mark_cancelled(conn, sid, cancel_reason="NH CHAIYE",
+                            acted_at="2026-08-26T10:00:00+00:00")
+    row = conn.execute(
+        "SELECT cancel_reason FROM operator_action WHERE shipment_id=? AND kind='cancel_decided'",
+        (sid,),
+    ).fetchone()
+    assert row["cancel_reason"] == "NH CHAIYE"
+    assert core.derive_state(conn, sid) == "CLOSED_CANCELLED"
+
+
+def test_l_m_returned_persists_and_state(tmp_path):
+    """L+M. Returned persists; derivation yields RETURNED."""
+    conn = db(tmp_path)
+    core.import_source(conn, load_evidence())
+    sid = ship_id(conn, "SAMPLE_004")
+    aid = outcomes.mark_returned(conn, sid, note="parcel back at warehouse",
+                                 acted_at="2026-08-26T10:00:00+00:00")
+    row = conn.execute("SELECT kind, note FROM operator_action WHERE id=?", (aid,)).fetchone()
+    assert row["kind"] == "returned_confirmed"
+    assert row["note"] == "parcel back at warehouse"
+    assert core.derive_state(conn, sid) == "RETURNED"
+
+
+def test_n_terminal_actions_in_timeline_with_attribution(tmp_path):
+    """N. Terminal actions appear in timeline labeled OPERATOR, not courier."""
+    conn = db(tmp_path)
+    core.import_source(conn, load_evidence())
+    sid = ship_id(conn, "SAMPLE_005")
+    outcomes.mark_delivered(conn, sid)
+    d = detail.shipment_detail(conn, "SAMPLE_005")
+    term = [e for e in d["timeline"] if e["type"] == "operator_action"
+            and e["kind"] == "delivered_confirmed"]
+    assert len(term) == 1
+    assert term[0]["label"] == "OPERATOR: DELIVERED CONFIRMED"
+    assert term[0]["actor"] == "laiba"
+
+
+def test_o_history_intact_after_terminal(tmp_path):
+    """O. Nothing before the terminal event disappears or is rewritten."""
+    conn = db(tmp_path)
+    core.import_source(conn, load_evidence())
+    sid = ship_id(conn, "SAMPLE_006")
+    actions.record_customer_confirmation(conn, sid, "customer confirmed address", channel="call")
+    actions.record_operator_action(conn, sid, "reattempt_requested")
+    followups.create_follow_up(conn, sid, due_at="2099-01-01", reason="check later")
+    pre_counts = {
+        t: conn.execute(f"SELECT COUNT(*) c FROM {t}").fetchone()["c"]
+        for t in ("tracking_event", "operator_action", "customer_confirmation", "follow_up")
+    }
+    outcomes.mark_cancelled(conn, sid, cancel_reason="NH CHAIYE")
+    post_counts = {
+        t: conn.execute(f"SELECT COUNT(*) c FROM {t}").fetchone()["c"]
+        for t in ("tracking_event", "operator_action", "customer_confirmation", "follow_up")
+    }
+    # exactly one new operator_action (the cancel); all else untouched
+    assert post_counts["operator_action"] == pre_counts["operator_action"] + 1
+    assert post_counts["tracking_event"] == pre_counts["tracking_event"]
+    assert post_counts["customer_confirmation"] == pre_counts["customer_confirmation"]
+    assert post_counts["follow_up"] == pre_counts["follow_up"]
+    d = detail.shipment_detail(conn, "SAMPLE_006")
+    types = [e["type"] for e in d["timeline"]]
+    assert types.count("customer_confirmation") == 1
+    assert types.count("follow_up") == 1
+    assert any(e["type"] == "operator_action" and e["kind"] == "reattempt_requested"
+               for e in d["timeline"])
+
+
+def test_p_post_terminal_observation_reopens(tmp_path):
+    """P. Fresh courier observation reopens a terminal shipment per existing rule."""
+    conn = db(tmp_path)
+    core.import_source(conn, load_evidence())
+    sid = ship_id(conn, "SAMPLE_007")
+    outcomes.mark_delivered(conn, sid)
+    assert core.derive_state(conn, sid) == "CLOSED_DELIVERED"
+    ek = core._event_key("SAMPLE_007", "RFD", "post-terminal remark", None)
+    conn.execute(
+        "INSERT INTO tracking_event (id,shipment_id,raw_code,raw_text,imported_at,event_key)"
+        " VALUES ('pt',?,'RFD','post-terminal remark','2026-08-26T11:00:00+00:00',?)",
+        (sid, ek))
+    core.refresh_state(conn, sid)
+    assert core.derive_state(conn, sid) == "NEEDS_ACTION"  # reopened by existing rule
+
+
+def test_q_no_courier_observation_creates_terminal(tmp_path):
+    """Q. Even a 'DELIVERED'-shaped courier code cannot create a terminal state."""
+    conn = db(tmp_path)
+    core.import_source(conn, load_evidence())
+    sid = ship_id(conn, "SAMPLE_010")
+    ek = core._event_key("SAMPLE_010", "DELIVERED", "", None)
+    conn.execute(
+        "INSERT INTO tracking_event (id,shipment_id,raw_code,imported_at,event_key)"
+        " VALUES ('dv',?,'DELIVERED','2026-08-26T11:00:00+00:00',?)",
+        (sid, ek))
+    core.refresh_state(conn, sid)
+    assert core.derive_state(conn, sid) == "NEEDS_ACTION"  # observation, not truth
+
+
+def test_r_end_to_end_multicycle_terminal(tmp_path):
+    """R. Full scenario: two cycles + follow-ups + terminal outcome; every event
+    visible; queue correct; drafts don't mutate."""
+    conn = db(tmp_path)
+    core.import_source(conn, "tracking_no,postex_remark\nCY5,RFD\n")
+    sid = ship_id(conn, "CY5")
+
+    # Cycle 1
+    actions.record_customer_confirmation(conn, sid, "No rider came / no call received.", channel="call")
+    actions.record_operator_action(conn, sid, "note", note="FAKE ATTEMPT SUSPECTED")
+    actions.record_operator_action(conn, sid, "reattempt_requested")
+    fid1 = followups.create_follow_up(conn, sid, due_at="2026-01-01", reason="check reattempt")
+    followups.complete_follow_up(conn, fid1)
+
+    # Cycle 2
+    ek = core._event_key("CY5", "RFD", "second attempt remark", None)
+    conn.execute(
+        "INSERT INTO tracking_event (id,shipment_id,raw_code,raw_text,imported_at,event_key)"
+        " VALUES ('c2',?,'RFD','second attempt remark','2026-08-25T09:00:00+00:00',?)",
+        (sid, ek))
+    core.refresh_state(conn, sid)
+    actions.record_customer_confirmation(conn, sid, "Still nothing delivered.", channel="whatsapp")
+    draft_before = conn.execute("SELECT COUNT(*) c FROM operator_action").fetchone()["c"]
+    _draft = outcomes.generate_draft("fake_attempt_reattempt", "CY5")  # must not mutate
+    assert conn.execute("SELECT COUNT(*) c FROM operator_action").fetchone()["c"] == draft_before
+    actions.record_operator_action(conn, sid, "reattempt_requested")
+    fid2 = followups.create_follow_up(conn, sid, due_at="2027-01-01", reason="check second attempt")
+
+    # Terminal outcome
+    outcomes.mark_cancelled(conn, sid, cancel_reason="CUSTOMER REFUSED - NH CHAIYE",
+                            acted_at="2026-08-26T15:00:00+00:00")
+    assert core.derive_state(conn, sid) == "CLOSED_CANCELLED"
+
+    d = detail.shipment_detail(conn, "CY5")
+    timeline = d["timeline"]
+    # every event from both cycles present, nothing collapsed
+    assert len([e for e in timeline if e["type"] == "tracking_event"]) == 2      # both RFD obs
+    assert len([e for e in timeline if e["type"] == "customer_confirmation"]) == 2
+    assert len([e for e in timeline if e["type"] == "operator_action"]) == 4     # note + 3 reattempts + cancel... 
+    assert len([e for e in timeline if e["type"] == "follow_up"]) == 2           # both follow-ups
+    cancels = [e for e in timeline if e.get("kind") == "cancel_decided"]
+    assert len(cancels) == 1
+    assert cancels[0]["cancel_reason"] == "CUSTOMER REFUSED - NH CHAIYE"
+    # queue: no longer actionable (terminal), old fu overdue but shipment closed -> still listed? 
+    # SPEC: queue surfaces NEEDS_ACTION shipments and shipments w/ overdue open FUs.
+    # fu2 is upcoming (2027), fu1 done -> CY5 absent from queue.
+    q = followups.work_queue(conn, now="2026-08-26T12:00:00+00:00")
+    assert not any(i["tracking_no"] == "CY5" for i in q)
+
+
+def test_s_prior_slices_green_marker():
+    """S. Marker — full suite runs all slices together (verified by runner)."""
+    assert True

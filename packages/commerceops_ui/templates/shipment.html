@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Shipment {{ d.tracking_no }}</title>
+<style>
+ body{font-family:consolas,monospace;max-width:1200px;margin:2rem auto;padding:0 1rem;background:#111;color:#ddd}
+ .label-courier{color:#6cf;font-weight:bold}
+ .label-operator{color:#fd6;font-weight:bold}
+ .label-customer{color:#8f8;font-weight:bold}
+ .label-followup{color:#c9f;font-weight:bold}
+ .state{font-size:1.2em;background:#333;padding:.1rem .5rem;border-radius:3px}
+ ol.timeline li{margin:.4rem 0;padding:.3rem;border-left:3px solid #444}
+ fieldset{border:1px solid #444;margin:.8rem 0}
+ input,select,textarea{background:#000;color:#ddd;border:1px solid #555;font-family:inherit;padding:.2rem}
+ .err{background:#622;color:#fcc;padding:.4rem;border-radius:3px}
+ button{background:#345;color:#ddf;border:none;padding:.25rem .7rem;cursor:pointer}
+ pre.draft{background:#000;border:1px solid #444;padding:.5rem;white-space:pre-wrap}
+ .terminal-notice{background:#511;padding:.3rem .5rem;display:inline-block}
+</style></head>
+<body>
+<p><a href="/">← work queue</a></p>
+<h1>{{ d.tracking_no }}</h1>
+<p>
+State: <span class="state">{{ d.derived_state }}</span>
+{% if d.cache_mismatch %} <span class="err">cached-state out of sync ({{ d.cached_state }})</span>{% endif %}
+| Courier: {{ d.courier or 'unknown' }}
+| Phone: {{ d.customer_phone or 'not provided' }}
+</p>
+
+<h2>Timeline</h2>
+<ol class="timeline">
+{% for e in d.timeline %}
+<li>
+ {% if e.label == 'COURIER CLAIM' %}<span class="label-courier">COURIER CLAIM</span>
+ {% elif e.type == 'customer_confirmation' %}<span class="label-customer">CUSTOMER CONFIRMED</span>
+ {% elif e.type == 'follow_up' %}<span class="label-followup">FOLLOW-UP RECORD</span>
+ {% else %}<span class="label-operator">{{ e.label }}</span>{% endif %}
+ — {{ e.at[:19] }}
+ {% if e.type == 'tracking_event' %}
+   | code=<b>{{ e.raw_code }}</b>{% if e.raw_text %} | text={{ e.raw_text }}{% endif %}
+   {% if not e.occurred_at_source_provided %}<em>(no source timestamp)</em>{% endif %}
+ {% elif e.type == 'operator_action' %}
+   {% if e.cancel_reason %} | reason=<b>{{ e.cancel_reason }}</b>{% endif %}
+   {% if e.note %} | {{ e.note }}{% endif %}
+   | actor={{ e.actor }}
+ {% elif e.type == 'customer_confirmation' %}
+   | [{{ e.channel or 'unspecified' }}] {{ e.content }}
+ {% elif e.type == 'follow_up' %}
+   | due=<b>{{ e.due_at }}</b> | reason={{ e.reason }} | status={{ e.status }}{% if e.closed_at %} closed {{ e.closed_at[:19] }}{% endif %}
+ {% endif %}
+ {% if e.state_change_after %}<em>[{{ e.state_change_after.from_state }} → {{ e.state_change_after.to_state }}]</em>{% endif %}
+</li>
+{% endfor %}
+{% if not d.timeline %}<li>No events recorded.</li>{% endif %}
+</ol>
+
+{% if error %}<p class="err">{{ error }}</p>{% endif %}
+
+<h2>Record customer confirmation</h2>
+<form method="post" action="/shipment/{{ d.tracking_no }}/customer-confirmation">
+ Channel: <input name="channel" placeholder="call / whatsapp">
+ Content: <input name="content" size="60" placeholder='verbatim, e.g. "No rider came."'>
+ <button type="submit">Save</button>
+</form>
+
+<h2>Operator actions</h2>
+<form method="post" action="/shipment/{{ d.tracking_no }}/note">
+ Note / interpretation: <input name="note" size="50" placeholder='e.g. "FAKE ATTEMPT SUSPECTED"'>
+ <button type="submit">Add note</button>
+</form>
+<fieldset><legend>One-click actions</legend>
+{% for k in action_kinds %}
+ <form method="post" action="/shipment/{{ d.tracking_no }}/action/{{ k }}" style="display:inline">
+  <button type="submit">{{ k.replace('_',' ') }}</button>
+ </form>
+{% endfor %}
+</fieldset>
+
+<h2>Follow-up (human-set date only)</h2>
+<form method="post" action="/shipment/{{ d.tracking_no }}/follow-up">
+ Due date: <input name="due_at" placeholder="2026-08-30">
+ Reason: <input name="reason" size="40" placeholder="check reattempt">
+ <button type="submit">Create follow-up</button>
+</form>
+{% if fus.open or fus.closed %}
+<ul>
+{% for f in fus.open + fus.closed %}
+ <li>[{{ f.status }}] due {{ f.due_at }} — {{ f.reason }}
+  {% if f.status == 'open' %}
+  <form method="post" action="/follow-up/{{ f.id }}/complete" style="display:inline">
+   <input type="hidden" name="tracking_no" value="{{ d.tracking_no }}">
+   <button type="submit">complete</button>
+  </form>
+  {% endif %}
+ </li>
+{% endfor %}
+</ul>
+{% endif %}
+
+<h2>WhatsApp drafts (copy — never sent automatically)</h2>
+{% for intent, msg in drafts.items() %}
+<p><b>{{ intent }}</b></p>
+<pre class="draft" id="draft-{{ intent }}">{{ msg }}</pre>
+<button onclick="navigator.clipboard.writeText(document.getElementById('draft-{{ intent }}').textContent)">copy</button>
+{% endfor %}
+
+<h2>Terminal outcomes (explicit human decision)</h2>
+<fieldset>
+ <form method="post" action="/shipment/{{ d.tracking_no }}/terminal/delivered" style="display:inline">
+  <button type="submit">Mark DELIVERED</button>
+ </form>
+ <form method="post" action="/shipment/{{ d.tracking_no }}/terminal/returned" style="display:inline">
+  <button type="submit">Mark RETURNED</button>
+ </form>
+</fieldset>
+<fieldset>
+ <form method="post" action="/shipment/{{ d.tracking_no }}/terminal/cancelled">
+  Cancellation reason (required): <input name="reason" size="40" placeholder='e.g. "NH CHAIYE"'>
+  <button type="submit">Cancel shipment</button>
+ </form>
+</fieldset>
+</body></html>

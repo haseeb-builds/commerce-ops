@@ -1,0 +1,37 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Task {{ task.id[:12] }}</title>
+<style>body{font-family:sans-serif;margin:2em;}h2{margin-top:1.5em;}table{border-collapse:collapse;}th,td{border:1px solid #ccc;padding:0.4em;}th{background:#f4f4f4;}.meta{color:#666;font-size:0.9em;}.err{color:#c00;}</style>
+</head><body>
+<h1>Task {{ task.id }}</h1>
+<p class="meta">Type: <b>{{ task.type }}</b> &middot; Capability: {{ task.capability }} &middot; Status: <b>{{ task.status }}</b></p>
+<p>Case: <code>{{ task.case_id }}</code>{% if shipment %} &middot; Shipment: <a href="/shipment/{{ shipment.tracking_no }}">{{ shipment.tracking_no }}</a>{% endif %}</p>
+
+<h2>Complete this task</h2>
+{% if task.status == "PENDING" %}
+{% if task.type == "VERIFY_CUSTOMER" %}
+<form method="post" action="/tasks/{{ task.id }}/complete">
+  <input type="hidden" name="completion_method" value="whatsapp">
+  <label>Customer response:<br><textarea name="completion_result" rows="3" cols="60">{"customer_response":"I did not refuse"}</textarea></label><br><br>
+  <button type="submit">Submit verification</button>
+</form>
+{% elif task.type == "DECIDE_ACTION" %}
+<form method="post" action="/tasks/{{ task.id }}/complete">
+  <input type="hidden" name="completion_method" value="reattempt_requested">
+  <label>Decision payload (JSON):<br><textarea name="completion_result" rows="3" cols="60">{"decision_type":"reattempt_requested","notes":"Customer denied refusal"}</textarea></label><br><br>
+  <button type="submit">Submit decision</button>
+</form>
+{% else %}
+<form method="post" action="/tasks/{{ task.id }}/complete">
+  <label>Completion payload (JSON):<br><textarea name="completion_result" rows="3" cols="60">{"completion_notes":"done"}</textarea></label><br><br>
+  <button type="submit">Submit</button>
+</form>
+{% endif %}
+{% else %}
+<p class="meta">This task is {{ task.status }} and cannot be completed again.</p>
+{% endif %}
+
+<h2>Original payload</h2>
+<pre>{{ (task.payload or {}) | tojson(indent=2) }}</pre>
+
+<p><a href="/tasks/pending">← back to pending tasks</a></p>
+</body></html>

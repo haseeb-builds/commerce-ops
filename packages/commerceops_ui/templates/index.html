@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Commerce Ops — Queue</title>
+<style>
+ body{font-family:consolas,monospace;max-width:1100px;margin:2rem auto;padding:0 1rem;background:#111;color:#ddd}
+ a{color:#7ab}
+ table{border-collapse:collapse;width:100%}
+ td,th{border:1px solid #444;padding:.35rem .5rem;text-align:left}
+ th{background:#222}
+ .reason{background:#3a3;padding:.05rem .3rem;border-radius:3px;color:#111;font-size:.85em;margin-right:.3rem;display:inline-block}
+</style></head>
+<body>
+<h1>Commerce Ops — Work Queue</h1>
+<p><a href="/import">+ Import shipments</a> · {{ total_shipments }} shipment(s) tracked</p>
+{% if queue %}
+<table>
+<tr><th>Tracking No</th><th>Latest Courier Claim</th><th>Last Event</th><th>Why actionable</th><th>Overdue F/U</th></tr>
+{% for item in queue %}
+<tr>
+ <td><a href="/shipment/{{ item.tracking_no }}">{{ item.tracking_no }}</a></td>
+ <td>{{ item.latest_raw_code or '—' }}</td>
+ <td>{{ (item.last_event_at or '')[:19] }}</td>
+ <td>{% for r in item.reasons %}<span class="reason">{{ r }}</span>{% endfor %}</td>
+ <td>{{ item.overdue_follow_up_count if item.overdue_follow_up_count else '' }}</td>
+</tr>
+{% endfor %}
+</table>
+{% else %}
+<p>Queue is empty. Nothing needs action.</p>
+{% endif %}
+</body></html>
