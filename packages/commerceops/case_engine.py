@@ -131,9 +131,13 @@ def evaluate_case(conn: sqlite3.Connection, case_id: str) -> EvaluationResult:
         disposition = policy_result["disposition"]
         if disposition == "HUMAN_TASK_REQUIRED":
             capability_name = policy_result["capability"]
-            # Execute the capability request through the capability layer
-            # The capability layer handles idempotency and creates appropriate tracking records
-            payload = {}  # Policy layer should provide payload in future iterations
+            # Tie the task's idempotency key to the evidence cycle that
+            # requires it.  Re-evaluating unchanged evidence returns the same
+            # pending task; a genuinely new courier/customer record can open
+            # a new task after the prior one was completed.
+            payload = {
+                "evidence_ids": sorted(policy_result["evidence_ids"]),
+            }
             capability.execute_capability(
                 conn,
                 case_id,

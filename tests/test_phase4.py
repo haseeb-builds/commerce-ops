@@ -13,6 +13,7 @@ import os
 import sys
 import tempfile
 import json
+import uuid
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "packages"))
@@ -39,6 +40,29 @@ def backdate_tracking_event(conn, shipment_id: str, ts: str) -> None:
     conn.execute(
         "UPDATE tracking_event SET imported_at=? WHERE shipment_id=?", (ts, shipment_id)
     )
+
+
+def append_courier_observation(conn, shipment_id: str, raw_code: str,
+                               raw_text: str, imported_at: str) -> None:
+    """Add a distinct courier observation for a fresh-evidence cycle.
+
+    An identical CSV row is intentionally idempotent under the V0 event-key
+    contract; it is not new evidence.  A second observation therefore carries
+    its own source text and event key, as a real second courier report would.
+    """
+    tracking_no = conn.execute(
+        "SELECT tracking_no FROM shipment WHERE id=?", (shipment_id,)
+    ).fetchone()["tracking_no"]
+    event_key = core._event_key(tracking_no, raw_code, raw_text, None)
+    conn.execute(
+        """
+        INSERT INTO tracking_event
+        (id, shipment_id, raw_code, raw_text, occurred_at, imported_at, event_key)
+        VALUES (?, ?, ?, ?, NULL, ?, ?)
+        """,
+        (uuid.uuid4().hex, shipment_id, raw_code, raw_text, imported_at, event_key),
+    )
+    core.refresh_state(conn, shipment_id)
 
 
 def make_rfd_case(conn, tracking_no="SN1", backdate_to=None):
@@ -198,20 +222,25 @@ def test_new_evidence_reevaluates_same_case():
     # Verify
     vt = capability.execute_capability(conn, case_id, "VERIFY_CUSTOMER", {})
     operational.complete_human_task_with_evidence(
-        conn, vt, {"customer_response": "I did not refuse"}
+        conn, vt, {
+            "customer_response": "I did not refuse",
+            "verified_at": "2026-06-15T08:30:00+00:00",
+        }
     )
     # Decide reattempt
     dt = [t for t in operational.get_pending_human_tasks_with_context(conn)
           if t["type"] == "DECIDE_ACTION"][0]["id"]
-    operational.complete_human_task_with_evidence(conn, dt, {"decision_type": "reattempt_requested"})
+    operational.complete_human_task_with_evidence(conn, dt, {
+        "decision_type": "reattempt_requested",
+        "decided_at": "2026-06-15T09:00:00+00:00",
+    })
     # Same Case
     case_after = case_mod.get_case(conn, case_id)
     assert case_after["status"] == "OPEN"
-    # New courier RFD evidence backdated to AFTER the reattempt action
-    core.import_source(conn, "tracking_no,postex_remark,our_remark,status,customer_phone\nSN_E1,RFD,,\n")
-    conn.execute(
-        "UPDATE tracking_event SET imported_at=? WHERE shipment_id=? AND raw_code='RFD' AND imported_at > ?",
-        ("2026-06-15T13:00:00+00:00", sid, "2026-06-15T08:00:00+00:00"),
+    # A distinct courier observation arrives after the reattempt action.
+    append_courier_observation(
+        conn, sid, "RFD", "second courier RFD observation",
+        "2026-06-15T18:00:00+00:00",
     )
     ev = case_engine.evaluate_case(conn, case_id)
     assert ev.disposition == "HUMAN_TASK_REQUIRED"
@@ -312,6 +341,7 @@ def test_canonical_end_to_end_lifecycle():
     result = operational.complete_human_task_with_evidence(conn, vt, {
         "customer_response": "I did not refuse the parcel",
         "verification_method": "whatsapp",
+        "verified_at": "2026-06-15T08:30:00+00:00",
     })
     assert result["success"] is True
     assert result["next_evaluation"].capability == "DECIDE_ACTION"
@@ -323,16 +353,16 @@ def test_canonical_end_to_end_lifecycle():
     result = operational.complete_human_task_with_evidence(conn, dt, {
         "decision_type": "reattempt_requested",
         "notes": "Customer denied",
+        "decided_at": "2026-06-15T09:00:00+00:00",
     })
     assert result["success"] is True
     assert result["next_evaluation"].disposition == "MONITOR"
     assert result["next_evaluation"].capability is None
 
     # (3) New evidence → re-evaluates SAME case
-    core.import_source(conn, "tracking_no,postex_remark,our_remark,status,customer_phone\nSN_FINAL,RFD,,\n")
-    conn.execute(
-        "UPDATE tracking_event SET imported_at=? WHERE shipment_id=? AND raw_code='RFD' AND imported_at > ?",
-        ("2026-06-15T14:00:00+00:00", sid, "2026-06-15T08:00:00+00:00"),
+    append_courier_observation(
+        conn, sid, "RFD", "second courier RFD observation",
+        "2026-06-15T18:00:00+00:00",
     )
     ev = case_engine.evaluate_case(conn, case_id)
     assert ev.disposition == "HUMAN_TASK_REQUIRED"

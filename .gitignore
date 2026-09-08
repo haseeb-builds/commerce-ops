@@ -18,3 +18,7 @@ env/
 *~
 .DS_Store
 Thumbs.db
+
+tmp/
+
+skills/

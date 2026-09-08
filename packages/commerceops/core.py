@@ -295,7 +295,7 @@ def import_source(conn: sqlite3.Connection, text: str, source_label: str = None)
     actions_created = 0
 
     try:
-        conn.execute("BEGIN")
+        conn.execute("SAVEPOINT import_source")
         conn.execute(
             "INSERT INTO import_batch (id, imported_at, source_label, row_count, duplicate_row_count, raw_source_text)"
             " VALUES (?,?,?,?,?,?)",
@@ -408,10 +408,11 @@ def import_source(conn: sqlite3.Connection, text: str, source_label: str = None)
             "UPDATE import_batch SET row_count=?, duplicate_row_count=? WHERE id=?",
             (len(rows), duplicates, batch_id),
         )
-        conn.commit()
     except Exception:
-        conn.rollback()
+        conn.execute("ROLLBACK TO SAVEPOINT import_source")
+        conn.execute("RELEASE SAVEPOINT import_source")
         raise
+    conn.execute("RELEASE SAVEPOINT import_source")
     return {
         "batch_id": batch_id,
         "rows_parsed": len(rows),

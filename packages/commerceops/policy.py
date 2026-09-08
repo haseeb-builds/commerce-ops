@@ -65,12 +65,15 @@ def evaluate_policy(
             "policy_version": coordination.policy_version,
         }
 
-    # We'll find the latest evidence of each type by timestamp.
-    # We'll define a helper to extract a timestamp from an evidence piece.
+    # A tracking event may carry both an occurrence time and an import time.
+    # Policy reacts to newly received courier evidence, so import time is the
+    # relevant ordering field when it is available.  This also preserves the
+    # source occurrence timestamp as evidence instead of rewriting it.
     def get_evidence_ts(e: Evidence) -> str:
         data = e.data
-        # Common timestamp fields: occurred_at, imported_at, acted_at, confirmed_at, created_at, due_at
-        for ts_field in ("occurred_at", "imported_at", "acted_at", "confirmed_at", "created_at", "due_at"):
+        # Common timestamp fields: imported_at, occurred_at, acted_at,
+        # confirmed_at, created_at, due_at.
+        for ts_field in ("imported_at", "occurred_at", "acted_at", "confirmed_at", "created_at", "due_at"):
             if ts_field in data and data[ts_field] is not None:
                 return data[ts_field]
         # If none found, we'll use a very old timestamp to put them at the beginning.
@@ -84,9 +87,6 @@ def evaluate_policy(
     latest_customer_confirmation = None
     latest_operator_action = None
 
-    # We'll also keep track of the latest evidence overall to see what the newest event is.
-    latest_evidence_overall = evidence_sorted[0] if evidence_sorted else None
-
     # We'll iterate through the sorted evidence to find the latest of each type.
     for e in evidence_sorted:
         if e.type == "tracking_event" and latest_tracking_event is None:
@@ -96,36 +96,24 @@ def evaluate_policy(
         elif e.type == "operator_action" and latest_operator_action is None:
             latest_operator_action = e
 
-    # Now we have the latest of each type (if any).
+    def has_newer_response_to(action: Evidence) -> bool:
+        """Whether evidence arrived after an operator decision.
 
-    # We'll also consider the coordination state: the case's latest_evidence_at should be <= the latest evidence timestamp.
-    # But we don't need that for the policy.
+        Operator decisions settle the evidence available at that point.  A
+        later courier observation or customer statement reopens evaluation;
+        human-task rows themselves are coordination records, not evidence.
+        """
+        action_ts = get_evidence_ts(action)
+        return any(
+            evidence_item.type in {"tracking_event", "customer_confirmation"}
+            and get_evidence_ts(evidence_item) > action_ts
+            for evidence_item in evidence
+        )
 
-    # We'll now apply the rules.
-
-    # Rule 1: If there is a latest operator_action that is a terminal kind, then we have made a decision.
-    #   Terminal kinds are: cancel_decided, delivered_confirmed, returned_confirmed
+    # A terminal decision remains settled until later evidence arrives.
     terminal_kinds = {"cancel_decided", "delivered_confirmed", "returned_confirmed"}
     if latest_operator_action and latest_operator_action.data.get("kind") in terminal_kinds:
-        # We have made a decision. Now we need to see if there is any new evidence after this decision.
-        # We'll check if there is any evidence (tracking_event or customer_confirmation) that is newer than this operator_action.
-        # If there is, then we need to re-evaluate based on that new evidence.
-        # We'll compare timestamps.
-        latest_op_ts = get_evidence_ts(latest_operator_action)
-        # Check for newer tracking_event or customer_confirmation
-        newer_tracking = False
-        newer_confirmation = False
-        for e in evidence_sorted:
-            if get_evidence_ts(e) > latest_op_ts:
-                if e.type == "tracking_event":
-                    newer_tracking = True
-                elif e.type == "customer_confirmation":
-                    newer_confirmation = True
-        # If there is newer evidence, we need to process it.
-        # But for simplicity, we'll assume that if there is newer evidence, we will handle it in the next evaluation.
-        # For now, we'll say that if there is no newer evidence, we can monitor.
-        if not newer_tracking and not newer_confirmation:
-            # We have made a decision and there is no new evidence, so we monitor.
+        if not has_newer_response_to(latest_operator_action):
             return {
                 "disposition": "MONITOR",
                 "capability": None,
@@ -134,25 +122,11 @@ def evaluate_policy(
                 "evidence_ids": [e.id for e in evidence],
                 "policy_version": coordination.policy_version,
             }
-        # If there is newer evidence, we fall through to the next rules.
-
-    # Rule 2: If we have not returned yet, and there is a latest operator_action that is a decision kind (like reattempt_requested),
-    #         and there is no new tracking_event after it, then we monitor.
-    #         We'll consider reattempt_requested as a decision kind.
-    decision_kinds = {"reattempt_requested", "cancel_decided"}  # note: cancel_decided is also terminal, but we already handled terminal above.
+    # A non-terminal decision (for example, a requested reattempt) likewise
+    # settles the current evidence until a new observation arrives.
+    decision_kinds = {"reattempt_requested"}
     if latest_operator_action and latest_operator_action.data.get("kind") in decision_kinds:
-        # Check if there is any newer tracking_event or customer_confirmation.
-        latest_op_ts = get_evidence_ts(latest_operator_action)
-        newer_tracking = False
-        newer_confirmation = False
-        for e in evidence_sorted:
-            if get_evidence_ts(e) > latest_op_ts:
-                if e.type == "tracking_event":
-                    newer_tracking = True
-                elif e.type == "customer_confirmation":
-                    newer_confirmation = True
-        if not newer_tracking and not newer_confirmation:
-            # We have made a decision and there is no new evidence, so we monitor.
+        if not has_newer_response_to(latest_operator_action):
             return {
                 "disposition": "MONITOR",
                 "capability": None,
@@ -162,17 +136,25 @@ def evaluate_policy(
                 "policy_version": coordination.policy_version,
             }
 
-    # Rule 3: If there is a latest tracking_event that is an exception code (we'll assume RFD for now) and
-    #         there is no customer confirmation that verifies it (or there is a contradiction), then we need to verify.
-    #         But note: we have to consider the timeline.
-    #         We'll check if the latest tracking_event is RFD and if there is a customer confirmation that is after it and confirms the refusal.
-    #         If there is a customer confirmation after the tracking_event that confirms the refusal, then verification is satisfied.
-    #         If there is a customer confirmation after the tracking_event that contradicts the refusal, then we have a contradiction and we need to decide.
-    #         If there is no customer confirmation after the tracking_event, then we need to verify.
+    # An RFD needs customer verification unless the customer responded after
+    # that specific courier observation.  A later RFD after an operator
+    # decision is always a fresh verification cycle; an earlier confirmation
+    # must not be reused to settle it.
     if latest_tracking_event and latest_tracking_event.data.get("raw_code") == "RFD":
-        # Check if there is a customer confirmation after this tracking_event.
         tracking_ts = get_evidence_ts(latest_tracking_event)
-        # We'll look for customer confirmations that are after this tracking_event.
+        if (
+            latest_operator_action is not None
+            and tracking_ts > get_evidence_ts(latest_operator_action)
+        ):
+            return {
+                "disposition": "HUMAN_TASK_REQUIRED",
+                "capability": "VERIFY_CUSTOMER",
+                "action_type": None,
+                "reason": "New RFD courier evidence after decision.",
+                "evidence_ids": [e.id for e in evidence],
+                "policy_version": coordination.policy_version,
+            }
+
         confirmations_after = []
         for e in evidence_sorted:
             if e.type == "customer_confirmation" and get_evidence_ts(e) > tracking_ts:
@@ -230,36 +212,9 @@ def evaluate_policy(
                 "policy_version": coordination.policy_version,
             }
 
-    # Rule 3: If we have not returned yet, and there is a latest operator_action that is a decision kind (like reattempt_requested),
-    #         and there is no new tracking_event after it, then we monitor.
-    #         We'll consider reattempt_requested as a decision kind.
-    decision_kinds = {"reattempt_requested", "cancel_decided"}  # note: cancel_decided is also terminal, but we already handled terminal above.
-    if latest_operator_action and latest_operator_action.data.get("kind") in decision_kinds:
-        # Check if there is any newer tracking_event or customer_confirmation.
-        latest_op_ts = get_evidence_ts(latest_operator_action)
-        newer_tracking = False
-        newer_confirmation = False
-        for e in evidence_sorted:
-            if get_evidence_ts(e) > latest_op_ts:
-                if e.type == "tracking_event":
-                    newer_tracking = True
-                elif e.type == "customer_confirmation":
-                    newer_confirmation = True
-        if not newer_tracking and not newer_confirmation:
-            # We have made a decision and there is no new evidence, so we monitor.
-            return {
-                "disposition": "MONITOR",
-                "capability": None,
-                "action_type": None,
-                "reason": "Decision has been made and no new evidence.",
-                "evidence_ids": [e.id for e in evidence],
-                "policy_version": coordination.policy_version,
-            }
-
     # Rule 4: If we have not returned yet, and there is no unresolved obligation, we monitor.
-    #         We'll assume that if we have not found any reason to require a human task, we monitor.
     return {
-        "disposition": "MONITOR",
+        "disposition":"MONITOR",
         "capability": None,
         "action_type": None,
         "reason": "No unresolved obligation detected.",
