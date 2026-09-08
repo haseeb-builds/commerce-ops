@@ -7,7 +7,9 @@
 <p>Case: <code>{{ task.case_id }}</code>{% if shipment %} &middot; Shipment: <a href="/shipment/{{ shipment.tracking_no }}">{{ shipment.tracking_no }}</a>{% endif %}</p>
 
 <h2>Complete this task</h2>
-{% if task.status == "PENDING" %}
+{% if task.blocked_reason and task.status in ["PENDING", "IN_PROGRESS"] %}
+<p class="err">{{ task.blocked_reason }}</p>
+{% elif task.status in ["PENDING", "IN_PROGRESS"] %}
 {% if task.type == "VERIFY_CUSTOMER" %}
 <form method="post" action="/tasks/{{ task.id }}/complete">
   <label>Contact method: <input name="verification_method" placeholder="call / whatsapp" required></label><br><br>

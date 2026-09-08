@@ -301,11 +301,12 @@ def complete_task(task_id: str,
             result_data = {"customer_response": customer_response,
                            "verification_method": verification_method or completion_method or "unknown"}
         elif task["type"] == "DECIDE_ACTION":
-            if decision_type == "cancel_decided" and confirm_cancel != "yes":
-                raise actions.ValidationError("Explicit cancellation confirmation is required")
             result_data = {"decision_type": decision_type, "notes": notes, "cancel_reason": cancel_reason}
         else:
             result_data = {"completion_notes": completion_notes}
+        # All encodings reach the same domain validation. Do not trust the
+        # typed form branch alone to authorize cancellation.
+        result_data.setdefault("confirm_cancel", confirm_cancel)
         if task["type"] == "VERIFY_CUSTOMER" and completion_method:
             result_data.setdefault("verification_method", completion_method)
         result = operational.complete_human_task_with_evidence(conn, task_id, result_data)
@@ -325,7 +326,7 @@ def complete_task(task_id: str,
 @app.get("/task/{task_id}", response_class=HTMLResponse)
 def task_detail(request: Request, task_id: str):
     """Get detailed information about a specific human task."""
-    from commerceops import human_task, case
+    from commerceops import human_task, case, case_engine
     conn = _conn()
     try:
         task = human_task.get_human_task(conn, task_id)
@@ -337,6 +338,7 @@ def task_detail(request: Request, task_id: str):
         case_obj = case.get_case(conn, task["case_id"])
         shipment_info = None
         if case_obj:
+            task["blocked_reason"] = case_engine.assess_case(conn, task["case_id"])[3].get("blocked_reason")
             shipment_row = conn.execute(
                 "SELECT tracking_no FROM shipment WHERE id=?", 
                 (case_obj["shipment_id"],)

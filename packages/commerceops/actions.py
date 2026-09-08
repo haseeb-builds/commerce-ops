@@ -16,7 +16,7 @@ import hashlib
 import sqlite3
 import uuid
 from datetime import timedelta
-from commerceops.timestamps import timestamp_key
+from commerceops.timestamps import timestamp_key, parse_timestamp, display_order
 
 from commerceops.core import utcnow, refresh_state
 from commerceops.transactions import atomic
@@ -36,15 +36,15 @@ class ValidationError(Exception):
 
 
 def _next_timestamp(conn, shipment_id: str, requested: str = None) -> str:
-    """Return a timestamp strictly greater than every existing event timestamp
-    for this shipment. Uses the requested/now value unless it collides with an
-    existing event (same clock tick as a bulk import), in which case it is
-    bumped by 1 microsecond past the newest existing event. This keeps the
-    documented ordering semantics ("later insert = newer") observable across
-    tables whose rowid sequences are independent. The bumped value remains a
-    faithful record: collisions only occur within the same wall-clock instant.
+    """Preserve a valid supplied timestamp; otherwise allocate a logical successor.
+
+    Defaults use now or one microsecond after the newest known stored instant.
+    Source offsets/strings are never rewritten. Unknown legacy instants are not
+    guessed here: terminal/task entry points separately block uncertain history.
     """
     if requested is not None:
+        if parse_timestamp(requested) is None:
+            raise ValidationError("Invalid timestamp; supply an ISO date/time with the source offset")
         return requested
     candidate = utcnow()
     rows = conn.execute(
@@ -56,7 +56,7 @@ def _next_timestamp(conn, shipment_id: str, requested: str = None) -> str:
         (shipment_id, shipment_id, shipment_id, shipment_id),
     ).fetchall()
 
-    latest = max((timestamp_key(row["ts"]) for row in rows if row["ts"]), default=None)
+    latest = max((parsed for row in rows if (parsed := parse_timestamp(row["ts"])) is not None), default=None)
     if latest is not None and timestamp_key(candidate) <= latest:
         candidate = (latest + timedelta(microseconds=1)).isoformat()
     return candidate
@@ -125,15 +125,15 @@ def record_customer_confirmation(conn, shipment_id: str, content: str,
 
 def list_operator_actions(conn, shipment_id: str):
     _check_shipment(conn, shipment_id)
-    return conn.execute(
-        "SELECT * FROM operator_action WHERE shipment_id=? ORDER BY acted_at, rowid",
-        (shipment_id,),
+    rows = conn.execute(
+        "SELECT rowid AS record_order, * FROM operator_action WHERE shipment_id=?", (shipment_id,)
     ).fetchall()
+    return sorted(rows, key=lambda row: (display_order(row["acted_at"]), row["record_order"]))
 
 
 def list_customer_confirmations(conn, shipment_id: str):
     _check_shipment(conn, shipment_id)
-    return conn.execute(
-        "SELECT * FROM customer_confirmation WHERE shipment_id=? ORDER BY confirmed_at, rowid",
-        (shipment_id,),
+    rows = conn.execute(
+        "SELECT rowid AS record_order, * FROM customer_confirmation WHERE shipment_id=?", (shipment_id,)
     ).fetchall()
+    return sorted(rows, key=lambda row: (display_order(row["confirmed_at"]), row["record_order"]))

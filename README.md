@@ -37,6 +37,17 @@ outside task completion, use the same evaluation command to refresh Case work.
 Reading the queue never mutates it; stale task submissions are rejected even if
 explicit evaluation has not yet run.
 
+## Phase 4.2 promotion safety
+
+Verified at **243 passing tests**, including 55 new promotion regressions.
+Current PENDING and IN_PROGRESS work is actionable; resolved Cases reopen on new
+evidence, while abandoned Cases require an explicit operator reopen.
+
+Before upgrading an existing database, read the [historical-data and lifecycle
+migration contract](docs/PHASE_4_2.md#upgrade-and-historical-data-handling).
+Malformed timestamps and unprovable legacy closure boundaries require visible,
+explicit review—not guessed chronology or silent completion.
+
 ## Specifications and implementation notes
 
 - [Implementation specification](docs/SPEC_V0.md) — supersedes the earlier workflow analysis.

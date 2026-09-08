@@ -21,6 +21,7 @@ from commerceops import autonomous_action
 from commerceops import followups
 from commerceops import capability
 from commerceops.transactions import atomic
+from commerceops.timestamps import parse_timestamp
 
 
 @dataclass(frozen=True)
@@ -54,9 +55,8 @@ class EvaluationResult:
 def evaluate_shipment(conn: sqlite3.Connection, shipment_id: str) -> EvaluationResult:
     """Explicit operational entry point: create once, otherwise reuse the Case.
 
-    Closed/abandoned Cases are not silently replaced or reopened by this command.
-    Their existing policy contract is retained. Normal reattempt cycles remain
-    on an OPEN Case throughout.
+    Resolved Cases reopen on new evidence within the same Case. Abandoned Cases
+    require an explicit operator reopen. Every status change is audited.
     """
     from commerceops.actions import _check_shipment
     with atomic(conn):
@@ -89,17 +89,30 @@ def assess_case(conn: sqlite3.Connection, case_id: str):
         policy_version=case_obj["policy_version"], human_tasks=tasks,
         autonomous_actions=autonomous_action.get_actions_for_case(conn, case_id),
         follow_ups=follow_up_rows["open"] + follow_up_rows["closed"],
+        closed_evidence_boundary=case.evidence_boundary(conn, case_obj),
+        requirement_scope=case.requirement_scope(conn, case_obj),
     )
     return case_obj, evidence, tasks, policy.evaluate_policy(evidence, coordination)
 
 
 def task_matches_work(task: dict, assessment: dict) -> bool:
-    """Legacy unbound tasks may be adopted only for the currently required capability."""
+    """Completion requires an explicit, non-empty current evidence basis."""
     if (assessment["disposition"] != "HUMAN_TASK_REQUIRED"
             or task["type"] != assessment["capability"]):
         return False
     basis = (task["payload"] or {}).get("evidence_ids")
-    return basis is None or sorted(basis) == assessment["work_evidence_ids"]
+    return (isinstance(basis, list) and bool(basis)
+            and all(isinstance(eid, str) for eid in basis)
+            and sorted(basis) == assessment["work_evidence_ids"]
+            and task["payload"].get("requirement_scope") == assessment.get("requirement_scope"))
+
+
+def work_payload(assessment):
+    """Only evidence references and, after reopening, the lifecycle audit ID."""
+    payload = {"evidence_ids": assessment["work_evidence_ids"]}
+    if assessment.get("requirement_scope"):
+        payload["requirement_scope"] = assessment["requirement_scope"]
+    return payload
 
 
 def _reconcile_human_work(conn, case_id, tasks, assessment):
@@ -112,17 +125,25 @@ def _reconcile_human_work(conn, case_id, tasks, assessment):
               and t["type"] in {"VERIFY_CUSTOMER", "DECIDE_ACTION"}]
     required_id = None
     if assessment["disposition"] == "HUMAN_TASK_REQUIRED":
-        payload = {"evidence_ids": assessment["work_evidence_ids"]}
+        payload = work_payload(assessment)
+        # Recover only when the immutable request hash PROVES this exact basis
+        # was originally requested. An actual {} legacy request cannot pass.
+        for task in active:
+            if (task["type"] == assessment["capability"]
+                    and "evidence_ids" not in (task["payload"] or {})
+                    and task["idempotency_key"] == human_task.task_key(case_id, assessment["capability"], payload)):
+                task["payload"] = {**(task["payload"] or {}), **payload}
+                conn.execute("UPDATE human_task SET payload=? WHERE id=?",
+                             (json.dumps(task["payload"]), task["id"]))
         matching = next((t for t in active if task_matches_work(t, assessment)), None)
         if matching:
             required_id = matching["id"]
-            if "evidence_ids" not in (matching["payload"] or {}):
-                # Bind pre-4.2 capability requests once without losing their ID.
-                conn.execute("UPDATE human_task SET payload=? WHERE id=?",
-                             (json.dumps({**(matching["payload"] or {}), **payload}), required_id))
         else:
             required_id = capability.execute_capability(
                 conn, case_id, assessment["capability"], payload)
+    # MONITOR alone is not authorization to discard a human obligation.
+    if required_id is None and not assessment.get("retire_work", False):
+        return
     for task in active:
         if task["id"] != required_id:
             human_task.supersede_human_task(
@@ -134,8 +155,12 @@ def evaluate_case(conn: sqlite3.Connection, case_id: str) -> EvaluationResult:
     """Atomically assess evidence, reconcile work and update coordination metadata."""
     with atomic(conn):
         case_obj, evidence, tasks, assessment = assess_case(conn, case_id)
+        if assessment.get("reopen_case"):
+            case.update_case_status(conn, case_id, "OPEN", reason=assessment.get("blocked_reason") or "New exception/customer evidence after resolution")
+            case_obj, evidence, tasks, assessment = assess_case(conn, case_id)
         latest = _get_latest_evidence_timestamp(evidence)
-        if latest and latest > case_obj["latest_evidence_at"]:
+        previous = parse_timestamp(case_obj["latest_evidence_at"])
+        if latest and (previous is None or parse_timestamp(latest) > previous):
             case.update_case_latest_evidence(conn, case_id, latest)
         _reconcile_human_work(conn, case_id, tasks, assessment)
         if assessment["disposition"] == "AUTONOMOUS_ACTION_AVAILABLE":
@@ -253,4 +278,4 @@ def _gather_evidence(conn: sqlite3.Connection, shipment_id: str) -> List[policy.
 
 def _get_latest_evidence_timestamp(evidence: List[policy.Evidence]) -> Optional[str]:
     """Latest received evidence timestamp, not a fabricated courier occurrence time."""
-    return max((policy.evidence_timestamp(e) for e in evidence), default=None)
+    return max((value for e in evidence if (value := policy.evidence_timestamp(e))), default=None)

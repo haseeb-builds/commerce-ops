@@ -11,7 +11,7 @@ import sqlite3
 import uuid
 from datetime import datetime, timezone
 
-from commerceops.timestamps import timestamp_key
+from commerceops.timestamps import timestamp_key, shipment_timestamp_issues
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS import_batch (
@@ -110,6 +110,22 @@ CREATE TABLE IF NOT EXISTS case_entity (
   policy_version INTEGER NOT NULL DEFAULT 1
 );
 
+-- Append-only lifecycle audit. Three scalar cursors identify evidence already
+-- present at closure; this is not a duplicate evidence/context snapshot.
+CREATE TABLE IF NOT EXISTS case_status_event (
+  id TEXT PRIMARY KEY,
+  case_entity_id TEXT NOT NULL REFERENCES case_entity(id),
+  from_status TEXT NOT NULL,
+  to_status TEXT NOT NULL,
+  changed_at TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  tracking_cursor INTEGER,
+  customer_cursor INTEGER,
+  operator_cursor INTEGER,
+  resolution TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_case_status_event_case ON case_status_event(case_entity_id);
+
 -- human_task represents a request for human capability/evidence/action
 CREATE TABLE IF NOT EXISTS human_task (
   id             TEXT PRIMARY KEY,
@@ -178,6 +194,10 @@ def derive_state(conn: sqlite3.Connection, shipment_id: str) -> str:
        else ACTION_TAKEN.
     3. Else -> NEW.
     """
+    if shipment_timestamp_issues(conn, shipment_id):
+        # Unknown chronology cannot establish terminal truth. Keep this shipment
+        # visible for explicit source-data review instead of crashing the queue.
+        return "NEEDS_ACTION"
     events = []
     for r in conn.execute(
         "SELECT rowid AS ord, kind AS code, acted_at AS at FROM operator_action WHERE shipment_id=?",
@@ -198,12 +218,27 @@ def derive_state(conn: sqlite3.Connection, shipment_id: str) -> str:
         events.append(("customer_confirmation", None, r["at"], r["ord"]))
     if not events:
         return "NEW"
-    # Newest = greatest timestamp; identical timestamps (e.g. bulk import)
-    # broken by insertion order — the later-inserted event is the newer one.
-    newest = max(events, key=lambda e: (timestamp_key(e[2]), e[3]))
-    if newest[0] == "operator_action" and newest[1] in TERMINAL_KINDS:
-        return TERMINAL_KINDS[newest[1]]
-    return "NEEDS_ACTION" if newest[0] == "tracking_event" else "ACTION_TAKEN"
+    # At the newest instant, rowids establish append order only within a
+    # source. Cross-source ties cannot prove a terminal decision came later.
+    newest_at = max(timestamp_key(e[2]) for e in events)
+    newest = {}
+    for event in events:
+        if timestamp_key(event[2]) == newest_at:
+            prior = newest.get(event[0])
+            if prior is None or event[3] > prior[3]:
+                newest[event[0]] = event
+    operator = newest.get("operator_action")
+    if operator and operator[1] in TERMINAL_KINDS:
+        if "tracking_event" in newest:
+            return "NEEDS_ACTION"
+        if "customer_confirmation" not in newest:
+            return TERMINAL_KINDS[operator[1]]
+    # A nonterminal human action is still evidence of action taken, including
+    # legacy CSV status/notes received alongside a claim. It is NOT resolution
+    # of the Case requirement; policy separately requires a later decision.
+    if operator or "customer_confirmation" in newest:
+        return "ACTION_TAKEN"
+    return "NEEDS_ACTION"
 
 
 def refresh_state(conn: sqlite3.Connection, shipment_id: str) -> str:

@@ -26,6 +26,12 @@ State: <span class="state">{{ d.derived_state }}</span>
 | Phone: {{ d.customer_phone or 'not provided' }}
 </p>
 
+{% if d.timestamp_issues %}
+<div class="err"><strong>Timestamp review required</strong>
+<p>Historical source timestamps are preserved, but their chronology is unknown. Terminal outcomes and Case task completion are blocked until an audited source-data repair. Other shipments remain operable.</p>
+<ul>{% for issue in d.timestamp_issues %}<li>{{ issue.source }} / {{ issue.record_id }} / {{ issue.field }}: {{ issue.value }}</li>{% endfor %}</ul>
+</div>
+{% endif %}
 <h2>Case work</h2>
 <form method="post" action="/shipment/{{ d.tracking_no }}/evaluate">
  <button type="submit">Evaluate current evidence</button>
@@ -40,7 +46,7 @@ State: <span class="state">{{ d.derived_state }}</span>
  {% elif e.type == 'customer_confirmation' %}<span class="label-customer">CUSTOMER CONFIRMED</span>
  {% elif e.type == 'follow_up' %}<span class="label-followup">FOLLOW-UP RECORD</span>
  {% else %}<span class="label-operator">{{ e.label }}</span>{% endif %}
- — {{ e.at[:19] }}
+ — {{ e.at[:19] }}{% if e.timestamp_warning %} <strong class="err">Invalid legacy timestamp — chronological position unknown</strong>{% endif %}{% if e.timestamp_tie %} <em>Same instant across sources — relative order unknown</em>{% endif %}
  {% if e.type == 'tracking_event' %}
    | code=<b>{{ e.raw_code }}</b>{% if e.raw_text %} | text={{ e.raw_text }}{% endif %}
    {% if not e.occurred_at_source_provided %}<em>(no source timestamp)</em>{% endif %}
@@ -90,7 +96,7 @@ State: <span class="state">{{ d.derived_state }}</span>
 {% if fus.open or fus.closed %}
 <ul>
 {% for f in fus.open + fus.closed %}
- <li>[{{ f.status }}] due {{ f.due_at }} — {{ f.reason }}
+ <li>[{{ f.status }}] due {{ f.due_at }} — {{ f.reason }}{% if f.timestamp_warning %} <strong class="err">Invalid legacy due date — review required, overdue status unknown</strong>{% endif %}
   {% if f.status == 'open' %}
   <form method="post" action="/follow-up/{{ f.id }}/complete" style="display:inline">
    <input type="hidden" name="tracking_no" value="{{ d.tracking_no }}">

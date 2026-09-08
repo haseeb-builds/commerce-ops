@@ -14,7 +14,8 @@ Part B: thin domain APIs over the EXISTING operator_action kinds
 derivation. No new states, no new rules.
 """
 import sqlite3
-from commerceops.timestamps import timestamp_key
+from commerceops.timestamps import timestamp_key, parse_timestamp, shipment_timestamp_issues
+from commerceops.transactions import atomic
 
 from commerceops.core import utcnow, refresh_state, derive_state
 from commerceops.actions import (
@@ -62,6 +63,10 @@ def _validate_terminal_timestamp(conn, shipment_id: str, acted_at: str, label: s
     derived state (because a newer event outranks it) is REJECTED with an
     explicit error instead of silently no-oping. The user's timestamp is never
     rewritten."""
+    if shipment_timestamp_issues(conn, shipment_id):
+        raise ValidationError("Legacy timestamp chronology requires source review before a terminal outcome")
+    if acted_at is not None and parse_timestamp(acted_at) is None:
+        raise ValidationError("Invalid terminal timestamp")
     if acted_at is None:
         return  # API default = now; _next_timestamp guarantees monotonicity
     from commerceops.core import derive_state
@@ -69,14 +74,16 @@ def _validate_terminal_timestamp(conn, shipment_id: str, acted_at: str, label: s
         "SELECT ts FROM ("
         " SELECT acted_at AS ts FROM operator_action WHERE shipment_id=?"
         " UNION ALL SELECT COALESCE(occurred_at, imported_at) FROM tracking_event WHERE shipment_id=?"
+        " UNION ALL SELECT imported_at FROM tracking_event WHERE shipment_id=?"
         " UNION ALL SELECT confirmed_at FROM customer_confirmation WHERE shipment_id=?)",
-        (shipment_id, shipment_id, shipment_id),
+        (shipment_id, shipment_id, shipment_id, shipment_id),
     ).fetchall()
     latest = max((row["ts"] for row in timestamps), key=timestamp_key, default=None)
-    if latest is not None and timestamp_key(acted_at) < timestamp_key(latest):
+    if latest is not None and timestamp_key(acted_at) <= timestamp_key(latest):
         raise ValidationError(
-            f"{label} rejected: supplied acted_at {acted_at!r} predates a newer "
-            f"event ({latest!r}); the terminal outcome would not take effect. "
+            f"{label} rejected: supplied acted_at {acted_at!r} "
+            f"{'predates a newer event' if timestamp_key(acted_at) < timestamp_key(latest) else 'ties another event'} "
+            f"({latest!r}); the terminal outcome would not take effect. "
             "Supply the current time or correct the history explicitly first."
         )
 
@@ -86,36 +93,32 @@ def mark_delivered(conn, shipment_id: str, actor: str = "laiba",
     """Explicit human confirmation of delivery -> CLOSED_DELIVERED via the
     existing derivation. No courier observation can produce this state.
     Back-dated acted_at values that would silently no-op are rejected (C2)."""
-    _check_shipment(conn, shipment_id)
-    _validate_terminal_timestamp(conn, shipment_id, acted_at, "mark_delivered")
-    return record_operator_action(
-        conn, shipment_id, kind="delivered_confirmed",
-        note=note, actor=actor, acted_at=acted_at,
-    )
+    return _record_terminal(conn, shipment_id, "delivered_confirmed", "mark_delivered",
+                            actor=actor, note=note, acted_at=acted_at)
 
 
 def mark_cancelled(conn, shipment_id: str, cancel_reason: str,
-                   actor: str = "laiba", note: str = None,
-                   acted_at: str = None):
-    """Explicit human cancellation. Reason REQUIRED, preserved verbatim.
-    Never inferred from courier codes. Back-dated acted_at that would
-    silently no-op is rejected (C2)."""
-    _check_shipment(conn, shipment_id)
-    _validate_terminal_timestamp(conn, shipment_id, acted_at, "mark_cancelled")
-    return record_operator_action(
-        conn, shipment_id, kind="cancel_decided",
-        cancel_reason=cancel_reason, note=note, actor=actor, acted_at=acted_at,
-    )
+                   actor: str = "laiba", note: str = None, acted_at: str = None):
+    """Explicit human cancellation; reason required and retained verbatim."""
+    return _record_terminal(conn, shipment_id, "cancel_decided", "mark_cancelled",
+                            actor=actor, note=note, cancel_reason=cancel_reason, acted_at=acted_at)
 
 
 def mark_returned(conn, shipment_id: str, actor: str = "laiba",
                   note: str = None, acted_at: str = None):
-    """Explicit human/operator confirmation that the parcel returned to shipper
-    -> RETURNED via the existing derivation. Back-dated acted_at that would
-    silently no-op is rejected (C2)."""
-    _check_shipment(conn, shipment_id)
-    _validate_terminal_timestamp(conn, shipment_id, acted_at, "mark_returned")
-    return record_operator_action(
-        conn, shipment_id, kind="returned_confirmed",
-        note=note, actor=actor, acted_at=acted_at,
-    )
+    """Explicit human confirmation of return, using the same terminal contract."""
+    return _record_terminal(conn, shipment_id, "returned_confirmed", "mark_returned",
+                            actor=actor, note=note, acted_at=acted_at)
+
+
+def _record_terminal(conn, shipment_id, kind, label, **fields):
+    # Reserve the writer before validation, not merely before the final INSERT.
+    # Nested operational completion retains its caller's SAVEPOINT/transaction.
+    from commerceops.core import TERMINAL_KINDS
+    with atomic(conn):
+        _check_shipment(conn, shipment_id)
+        _validate_terminal_timestamp(conn, shipment_id, fields.get("acted_at"), label)
+        action_id = record_operator_action(conn, shipment_id, kind=kind, **fields)
+        if derive_state(conn, shipment_id) != TERMINAL_KINDS[kind]:
+            raise ValidationError(f"{label} did not produce a valid terminal state")
+        return action_id

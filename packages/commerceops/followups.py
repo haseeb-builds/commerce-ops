@@ -16,6 +16,7 @@ import uuid
 
 from commerceops.core import utcnow, refresh_state
 from commerceops.transactions import atomic
+from commerceops.timestamps import parse_timestamp, display_order, shipment_timestamp_issues
 from commerceops.actions import (
     ShipmentNotFoundError, ValidationError, _check_shipment, _next_timestamp,
 )
@@ -35,6 +36,8 @@ def create_follow_up(conn, shipment_id: str, due_at: str, reason: str):
             raise ValidationError("follow-up requires a due_at (human-set)")
         if not (reason or "").strip():
             raise ValidationError("follow-up requires a non-empty reason")
+        if parse_timestamp(due_at) is None:
+            raise ValidationError("Invalid follow-up due_at timestamp")
         fid = uuid.uuid4().hex  # uniqueness never depends on clock granularity
         conn.execute(
             "INSERT INTO follow_up (id, shipment_id, reason, due_at, status, created_at)"
@@ -57,6 +60,8 @@ def complete_follow_up(conn, follow_up_id: str, *, completed_at: str = None):
             raise ValidationError(
                 f"follow-up {follow_up_id!r} is already {row['status']}; cannot complete twice"
             )
+        if completed_at is not None and parse_timestamp(completed_at) is None:
+            raise ValidationError("Invalid follow-up completion timestamp")
         conn.execute(
             "UPDATE follow_up SET status='done', closed_at=? WHERE id=?",
             (completed_at or utcnow(), follow_up_id),
@@ -78,11 +83,15 @@ def list_follow_ups(conn, shipment_id: str = None, now: str = None):
         query += " WHERE f.shipment_id=?"
         params.append(shipment_id)
     rows = [dict(r) for r in conn.execute(query, params).fetchall()]
-    out = {"open": [], "overdue": [], "upcoming": [], "closed": []}
-    for r in rows:
+    out = {"open": [], "overdue": [], "upcoming": [], "closed": [], "invalid": []}
+    for r in sorted(rows, key=lambda row: display_order(row["due_at"])):
         if r["status"] != "open":
             out["closed"].append(r)
-        elif r["due_at"] <= now:
+        elif parse_timestamp(r["due_at"]) is None:
+            r["timestamp_warning"] = True
+            out["invalid"].append(r)
+            out["open"].append(r)
+        elif parse_timestamp(r["due_at"]) <= parse_timestamp(now):
             out["overdue"].append(r)
             out["open"].append(r)
         else:
@@ -100,43 +109,34 @@ def work_queue(conn, now: str = None):
     """
     from commerceops.core import derive_state
     now = now or utcnow()
-    items = {}
-    for s in conn.execute("SELECT * FROM shipment"):
+    items = []
+    for shipment in conn.execute("SELECT * FROM shipment"):
+        sid = shipment["id"]
+        issues = shipment_timestamp_issues(conn, sid)
         reasons = []
-        latest = None
-        # SPEC §C: current_state column is a CACHE; the queue must evaluate
-        # the FRESH derivation so out-of-band writers can't hide shipments.
-        if derive_state(conn, s["id"]) == "NEEDS_ACTION":
-            ev = conn.execute(
-                "SELECT raw_code, COALESCE(occurred_at, imported_at) AS at FROM tracking_event"
-                " WHERE shipment_id=? ORDER BY COALESCE(occurred_at, imported_at) DESC, rowid DESC LIMIT 1",
-                (s["id"],),
-            ).fetchone()
+        if derive_state(conn, sid) == "NEEDS_ACTION":
             reasons.append("needs_action")
-            if ev:
-                latest = ev["at"]
-        fu = conn.execute(
-            "SELECT COUNT(*) c FROM follow_up WHERE shipment_id=? AND status='open' AND due_at<=?",
-            (s["id"], now),
-        ).fetchone()["c"]
-        if fu:
+        if issues:
+            reasons.append("timestamp_review")
+        events = conn.execute(
+            "SELECT rowid AS ord, raw_code, COALESCE(occurred_at,imported_at) AS at "
+            "FROM tracking_event WHERE shipment_id=?", (sid,)).fetchall()
+        latest = max(events, key=lambda row: (display_order(row["at"]), row["ord"]), default=None)
+        fus = list_follow_ups(conn, shipment_id=sid, now=now)
+        if fus["overdue"]:
             reasons.append("overdue_follow_up")
-            open_fu = conn.execute(
-                "SELECT MAX(due_at) m FROM follow_up WHERE shipment_id=? AND status='open'",
-                (s["id"],),
-            ).fetchone()
+        if fus["invalid"] and "timestamp_review" not in reasons:
+            reasons.append("timestamp_review")
         if not reasons:
             continue
-        items[s["id"]] = {
-            "tracking_no": s["tracking_no"],
-            "latest_raw_code": None,
-            "last_event_at": latest,
+        oldest_due = min((f["due_at"] for f in fus["open"]), key=display_order, default=None)
+        items.append({
+            "tracking_no": shipment["tracking_no"],
+            "latest_raw_code": latest["raw_code"] if latest else None,
+            "last_event_at": latest["at"] if latest else oldest_due,
             "reasons": reasons,
-            "overdue_follow_up_count": fu,
-        }
-        if fu and items[s["id"]]["last_event_at"] is None:
-            # no courier events; order by oldest open follow-up instead
-            items[s["id"]]["last_event_at"] = open_fu["m"]
-    result = [v for v in items.values()]
-    result.sort(key=lambda x: x["last_event_at"] or "")
-    return result
+            "overdue_follow_up_count": len(fus["overdue"]),
+            "timestamp_issues": issues,
+        })
+    items.sort(key=lambda item: display_order(item["last_event_at"]))
+    return items

@@ -28,6 +28,7 @@ from commerceops import actions
 from commerceops import followups
 from commerceops.actions import ValidationError
 from commerceops.transactions import atomic
+from commerceops.timestamps import parse_timestamp, display_order
 
 
 def get_pending_human_tasks_with_context(
@@ -48,7 +49,7 @@ def get_pending_human_tasks_with_context(
         List of pending human task dictionaries with contextual information
     """
     # Get basic pending tasks (each entry already has case_id renamed by the helper)
-    pending_tasks = [human_task.get_human_task(conn, t["id"]) for t in human_task.get_pending_tasks(conn)]
+    pending_tasks = [human_task.get_human_task(conn, t["id"]) for t in human_task.get_pending_tasks(conn, include_in_progress=True)]
     pending_tasks = [t for t in pending_tasks if t is not None]
     
     # Enrich each task with contextual information
@@ -83,11 +84,12 @@ def get_pending_human_tasks_with_context(
             SELECT 'customer_confirmation' as source, cc.id, 
                    SUBSTR(cc.content, 1, 20) as raw_code, cc.confirmed_at as ts
             FROM customer_confirmation cc WHERE cc.shipment_id=?
-            ORDER BY ts DESC LIMIT 5
+
             """,
             (shipment_id, shipment_id, shipment_id)
         ).fetchall()
         
+        evidence_rows = sorted(evidence_rows, key=lambda row: display_order(row["ts"]), reverse=True)[:5]
         recent_evidence = [
             {
                 "source": row["source"],
@@ -98,6 +100,7 @@ def get_pending_human_tasks_with_context(
             for row in evidence_rows
         ]
         
+        _, _, _, assessment = case_engine.assess_case(conn, case_id)
         # Build enriched task
         enriched_task = {
             **task,  # Include all original task fields
@@ -117,6 +120,7 @@ def get_pending_human_tasks_with_context(
                 "current_state": shipment_row["current_state"] if shipment_row else None
             },
             "recent_evidence": recent_evidence,
+            "blocked_reason": assessment.get("blocked_reason"),
             "task_context": _get_task_context(task["type"], case_id, shipment_id, conn)
         }
         
@@ -172,20 +176,20 @@ def complete_human_task_with_evidence(
             task = human_task.get_human_task(conn, task_id)
             if task is None:
                 raise ValueError(f"Human task not found: {task_id}")
-            if task["status"] != "PENDING":
+            if task["status"] not in {"PENDING", "IN_PROGRESS"}:
                 raise ValidationError(
-                    f"Human task {task_id} is not PENDING (current status: {task['status']})")
+                    f"Human task {task_id} is not PENDING or IN_PROGRESS (current status: {task['status']})")
             case_id = task["case_id"]
             case_obj, evidence, _, assessment = case_engine.assess_case(conn, case_id)
             if case_obj["status"] != "OPEN":
                 raise ValidationError("Case is not OPEN; re-evaluate before completing work")
+            if assessment.get("blocked_reason"):
+                raise ValidationError(assessment["blocked_reason"])
             task_type = task["type"]
             original_payload = task["payload"] or {}
             if task_type in {"VERIFY_CUSTOMER", "DECIDE_ACTION"}:
                 if not case_engine.task_matches_work(task, assessment):
                     raise ValidationError("Task is stale for current evidence; re-evaluate the shipment")
-                # Bind legacy tasks on successful completion, retaining their other data.
-                original_payload = {**original_payload, "evidence_ids": assessment["work_evidence_ids"]}
                 _validate_completion_timestamp(task_type, completion_result, evidence,
                                                assessment["work_evidence_ids"])
             shipment_id = case_obj["shipment_id"]
@@ -225,6 +229,8 @@ def _validate_completion_timestamp(task_type, result, evidence, basis):
     value = result.get(field)
     if value is None:
         return
+    if parse_timestamp(value) is None:
+        raise ValidationError(f"Invalid {field} timestamp")
     timestamp = evidence_timestamp(Evidence("completion", "operator_action", {"acted_at": value}))
     latest = max(evidence_timestamp(e) for e in evidence if e.id in basis)
     if timestamp <= latest:
@@ -303,6 +309,11 @@ def _handle_decide_action_completion(
             f"Valid decision kinds: {', '.join(sorted(DECISION_KINDS))}"
         )
     
+    if decision_type == "cancel_decided":
+        confirmation = completion_result.get("confirm_cancel")
+        if confirmation is not True and confirmation != "yes":
+            raise ValidationError("Explicit cancellation confirmation is required")
+
     # Use provided timestamp or generate next valid timestamp
     if decided_at is None:
         from commerceops.actions import _next_timestamp
@@ -310,17 +321,19 @@ def _handle_decide_action_completion(
     else:
         acted_at = decided_at
     
-    # Record the operator action (authoritative evidence)
-    action_id = actions.record_operator_action(
-        conn,
-        shipment_id,
-        decision_type,
-        note=notes if notes else None,
-        cancel_reason=completion_result.get("cancel_reason"),
-        actor=completion_result.get("actor", "laiba"),
-        acted_at=acted_at
-    )
-    
+    from commerceops import outcomes
+    fields = {"note": notes if notes else None,
+              "actor": completion_result.get("actor", "laiba"), "acted_at": acted_at}
+    if decision_type == "delivered_confirmed":
+        action_id = outcomes.mark_delivered(conn, shipment_id, **fields)
+    elif decision_type == "returned_confirmed":
+        action_id = outcomes.mark_returned(conn, shipment_id, **fields)
+    elif decision_type == "cancel_decided":
+        action_id = outcomes.mark_cancelled(
+            conn, shipment_id, cancel_reason=completion_result.get("cancel_reason"), **fields)
+    else:
+        action_id = actions.record_operator_action(conn, shipment_id, decision_type, **fields)
+
     return {
         "type": "operator_action",
         "record_id": action_id,

@@ -208,14 +208,17 @@ def _execute_verify_customer(
     Returns:
         ID of the created human task tracking the verification request
     """
-    # Create a human task to track that verification is needed
-    task_id = human_task.create_human_task(
-        conn,
-        case_id,
-        "VERIFY_CUSTOMER",
-        payload,
-    )
-    return task_id
+    from commerceops.transactions import atomic
+    with atomic(conn):
+        payload = _bind_current_basis(conn, case_id, "VERIFY_CUSTOMER", payload)
+        # Create a human task to track that verification is needed
+        task_id = human_task.create_human_task(
+            conn,
+            case_id,
+            "VERIFY_CUSTOMER",
+            payload,
+        )
+        return task_id
 
 
 def _execute_decide_action(
@@ -243,14 +246,17 @@ def _execute_decide_action(
     Returns:
         ID of the created human task tracking the decision request
     """
-    # Create a human task to track that a decision is needed
-    task_id = human_task.create_human_task(
-        conn,
-        case_id,
-        "DECIDE_ACTION",
-        payload,
-    )
-    return task_id
+    from commerceops.transactions import atomic
+    with atomic(conn):
+        payload = _bind_current_basis(conn, case_id, "DECIDE_ACTION", payload)
+        # Create a human task to track that a decision is needed
+        task_id = human_task.create_human_task(
+            conn,
+            case_id,
+            "DECIDE_ACTION",
+            payload,
+        )
+        return task_id
 
 
 def _execute_follow_up_action(
@@ -300,3 +306,18 @@ def _execute_follow_up_action(
         reason,
     )
     return follow_up_id
+
+def _bind_current_basis(conn, case_id, capability_name, payload):
+    """Bind a fresh supported request under the caller's writer transaction.
+
+    Non-current low-level requests may still be stored for Phase 1/3 compatibility,
+    but remain unbound and cannot complete. Evaluation replaces them explicitly.
+    """
+    if "evidence_ids" in payload:
+        return payload
+    from commerceops import case_engine
+    _, _, _, assessment = case_engine.assess_case(conn, case_id)
+    if (assessment["disposition"] == "HUMAN_TASK_REQUIRED"
+            and assessment["capability"] == capability_name):
+        return {**payload, **case_engine.work_payload(assessment)}
+    return payload

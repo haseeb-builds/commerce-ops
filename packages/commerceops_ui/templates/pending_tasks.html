@@ -3,6 +3,7 @@
 <style>body{font-family:sans-serif;margin:2em;}table{border-collapse:collapse;width:100%;}th,td{border:1px solid #ccc;padding:0.5em;text-align:left;}th{background:#f4f4f4;}tr:nth-child(even){background:#fafafa;}.pill{display:inline-block;padding:0.1em 0.5em;border-radius:0.5em;background:#eef;color:#225;font-size:0.9em;}.err{color:#c00;}.meta{color:#666;font-size:0.9em;}</style>
 </head><body>
 <h1>Pending Human Tasks</h1>
+<p class="meta">Includes current IN_PROGRESS work.</p>
 {% if error %}<p class="err">Error: {{ error }}</p>{% endif %}
 {% if next_disposition %}<p class="meta">Last evaluation: next disposition <span class="pill">{{ next_disposition }}</span>{% if next_capability %} / capability {{ next_capability }}{% endif %}{% if next_reason %} &mdash; {{ next_reason }}{% endif %}</p>{% endif %}
 {% if not pending_tasks %}<p>No pending human tasks.</p>
@@ -16,7 +17,7 @@
   <td>{{ t.type }}</td>
   <td><a href="/shipment/{{ t.case_info.tracking_no }}">{{ t.case_info.tracking_no or "—" }}</a></td>
   <td>{{ t.case_info.case_id[:12] }}…</td>
-  <td>{{ t.status }}</td>
+  <td>{{ t.status }}{% if t.blocked_reason %}<p class="err">{{ t.blocked_reason }}</p>{% endif %}</td>
   <td>
     <a href="/task/{{ t.id }}">Review evidence and complete</a>
     <form method="post" action="/shipment/{{ t.case_info.tracking_no }}/evaluate">

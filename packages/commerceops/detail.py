@@ -5,7 +5,7 @@ interpretation, no AI. Every timeline entry carries an explicit source label
 so courier claims are never presented as customer truth (SPEC §F).
 """
 from datetime import datetime
-from commerceops.timestamps import timestamp_key
+from commerceops.timestamps import parse_timestamp, display_order, shipment_timestamp_issues
 
 # Epistemic labels per SPEC §F — display-only, never stored back.
 SOURCE_LABELS = {
@@ -36,16 +36,15 @@ def get_shipment_by_tracking(conn, tracking_no: str):
 
 
 def _sort_key(entry):
-    """Same deterministic semantics as Slice 1 derive_state:
-    timestamp first, insertion order (rowid) as tie-break."""
-    return (timestamp_key(entry["at"]), entry["ord"])
+    """Stable presentation only; flagged cross-source ties imply no causality."""
+    return (display_order(entry["at"]), entry["ord"])
 
 
 def build_timeline(conn, shipment_id: str):
     """Complete chronological event history for one shipment.
 
-    Oldest-first. Equal timestamps ordered by insertion (later insert = newer),
-    exactly matching Slice 1's derivation tie-break.
+    Oldest-first for known instants, with unknown-time records flagged first.
+    Cross-source time ties have no known causal order and are marked explicitly.
     """
     entries = []
     for r in conn.execute(
@@ -108,6 +107,13 @@ def build_timeline(conn, shipment_id: str):
             "status": r["status"],
             "closed_at": r["closed_at"],
         })
+    instant_sources = {}
+    for entry in entries:
+        if entry["type"] != "follow_up" and (instant := parse_timestamp(entry["at"])) is not None:
+            instant_sources.setdefault(instant, set()).add(entry["type"])
+    for entry in entries:
+        entry["timestamp_tie"] = len(instant_sources.get(parse_timestamp(entry["at"]), ())) > 1
+        entry["timestamp_warning"] = parse_timestamp(entry["at"]) is None
     entries.sort(key=_sort_key)
     return entries
 
@@ -120,8 +126,9 @@ def _state_changes(entries):
 
     changes = []
     current = "NEW"
-    prev = None
     for e in entries:
+        if e["type"] == "follow_up":
+            continue
         if e["type"] == "tracking_event":
             new = "NEEDS_ACTION"
         elif e["type"] == "operator_action" and e.get("kind") in TERMINAL_KINDS:
@@ -131,6 +138,7 @@ def _state_changes(entries):
         if new != current and not (current == "NEW" and new == "ACTION_TAKEN"):
             changes.append({
                 "after_entry_ord": e["ord"],
+                "after_entry_type": e["type"],
                 "from_state": current,
                 "to_state": new,
                 "at": e["at"],
@@ -151,10 +159,11 @@ def shipment_detail(conn, tracking_no: str):
     from commerceops.core import derive_state
     entries = build_timeline(conn, s["id"])
     fresh_state = derive_state(conn, s["id"])
-    changes = _state_changes(entries)
+    issues = shipment_timestamp_issues(conn, s["id"])
+    changes = [] if issues or any(e["timestamp_tie"] for e in entries) else _state_changes(entries)
     for ch in changes:
         for e in entries:
-            if e["ord"] == ch["after_entry_ord"]:
+            if (e["type"], e["ord"]) == (ch["after_entry_type"], ch["after_entry_ord"]):
                 e["state_change_after"] = {
                     "from": ch["from_state"], "to": ch["to_state"],
                     "label": SOURCE_LABELS["state_change"],
@@ -172,6 +181,7 @@ def shipment_detail(conn, tracking_no: str):
         "cache_mismatch": fresh_state != s["current_state"],
         "created_at": s["created_at"],
         "timeline": entries,
+        "timestamp_issues": issues,
     }
 
 
@@ -193,6 +203,8 @@ def render_detail_html(detail) -> str:
     rows = []
     for e in detail["timeline"]:
         parts = [f"<strong>{e['label']}</strong>"]
+        if e.get("timestamp_warning"):
+            parts.append("<em>Invalid legacy timestamp: chronological position unknown</em>")
         if e["type"] == "tracking_event":
             parts.append(f"code=<code>{_esc(e['raw_code'])}</code>")
             if e["raw_text"]:
