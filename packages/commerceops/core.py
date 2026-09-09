@@ -9,7 +9,8 @@ import json
 import re
 import sqlite3
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from threading import Lock
 
 from commerceops.timestamps import timestamp_key, shipment_timestamp_issues
 
@@ -170,8 +171,26 @@ TERMINAL_KINDS = {
 }
 
 
+_utcnow_lock = Lock()
+_last_utcnow = None
+
+
 def utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    """Allocate a strictly increasing UTC application time within this process.
+
+    Wall-clock reads may repeat or move backwards. Serialize allocation and use
+    a one-microsecond logical successor in that case, without sleeping or
+    rewriting supplied evidence. This is not a cross-process/database clock:
+    default evidence writers still allocate against persisted shipment evidence,
+    and explicit terminal timestamps still must pass strict outcome validation.
+    """
+    global _last_utcnow
+    with _utcnow_lock:
+        now = datetime.now(timezone.utc)
+        if _last_utcnow is not None and now <= _last_utcnow:
+            now = _last_utcnow + timedelta(microseconds=1)
+        _last_utcnow = now
+        return now.isoformat()
 
 
 def connect(db_path: str) -> sqlite3.Connection:
