@@ -8,6 +8,19 @@ import json
 from commerceops.core import connect, utcnow
 
 
+def _decode_payload(raw):
+    """Keep malformed coordination rows readable and explicitly untrusted."""
+    if raw is None:
+        return None, None
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None, "malformed autonomous-action payload"
+    if not isinstance(value, dict):
+        return None, "autonomous-action payload is not an object"
+    return value, None
+
+
 def create_autonomous_action(
     conn,
     case_id: str,
@@ -83,7 +96,9 @@ def get_autonomous_action(conn, action_id: str) -> Optional[dict]:
         action = dict(row)
         # Rename case_entity_id to case_id for compatibility
         action["case_id"] = action.pop("case_entity_id")
-        action["payload"] = json.loads(action["payload"]) if action["payload"] else None
+        action["payload"], payload_error = _decode_payload(action["payload"])
+        if payload_error:
+            action["payload_error"] = payload_error
         return action
     return None
 
@@ -108,7 +123,9 @@ def get_actions_for_case(conn, case_id: str) -> List[dict]:
         action = dict(row)
         # Rename case_entity_id to case_id for compatibility
         action["case_id"] = action.pop("case_entity_id")
-        action["payload"] = json.loads(action["payload"]) if action["payload"] else None
+        action["payload"], payload_error = _decode_payload(action["payload"])
+        if payload_error:
+            action["payload_error"] = payload_error
         actions.append(action)
     return actions
 
@@ -200,6 +217,8 @@ def get_planned_actions(conn) -> List[dict]:
     actions = []
     for row in rows:
         action = dict(row)
-        action["payload"] = json.loads(action["payload"]) if action["payload"] else None
+        action["payload"], payload_error = _decode_payload(action["payload"])
+        if payload_error:
+            action["payload_error"] = payload_error
         actions.append(action)
     return actions

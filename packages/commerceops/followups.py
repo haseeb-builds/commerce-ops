@@ -13,6 +13,7 @@ creations remain two distinct rows.
 import hashlib
 import sqlite3
 import uuid
+import json
 
 from commerceops.core import utcnow, refresh_state
 from commerceops.transactions import atomic
@@ -62,10 +63,33 @@ def complete_follow_up(conn, follow_up_id: str, *, completed_at: str = None):
             )
         if completed_at is not None and parse_timestamp(completed_at) is None:
             raise ValidationError("Invalid follow-up completion timestamp")
+        closed_at = completed_at or utcnow()
         conn.execute(
             "UPDATE follow_up SET status='done', closed_at=? WHERE id=?",
-            (completed_at or utcnow(), follow_up_id),
+            (closed_at, follow_up_id),
         )
+        # A FOLLOW_UP_ACTION is coordination for this exact authoritative row.
+        # Completing the row through its standalone domain API must not leave a
+        # misleading pending task behind.  Restrict the synchronization to
+        # valid JSON and the stored reference; malformed/foreign coordination
+        # data is left visible for reconciliation rather than guessed.
+        for task in conn.execute(
+            "SELECT id, payload FROM human_task "
+            "WHERE status IN ('PENDING','IN_PROGRESS') AND type='FOLLOW_UP_ACTION'"
+        ).fetchall():
+            try:
+                payload = json.loads(task["payload"]) if task["payload"] else {}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if isinstance(payload, dict) and payload.get("follow_up_id") == follow_up_id:
+                payload["synchronized_follow_up_completion"] = {
+                    "completed_at": closed_at, "source": "follow_up"
+                }
+                conn.execute(
+                    "UPDATE human_task SET status='COMPLETED', payload=?, "
+                    "updated_at=?, completed_at=? WHERE id=? AND status IN ('PENDING','IN_PROGRESS')",
+                    (json.dumps(payload), closed_at, closed_at, task["id"]),
+                )
         return row  # pre-update record returned for reference
 
 

@@ -35,16 +35,49 @@ def create_human_task(
         # A cancellation closes a requirement incarnation, not its future.
         # Deriving the next key from the cancelled row makes concurrent retries
         # converge without changing the old row/key or creating a global cycle.
+        # An idempotency key is a request identity, not a global authority.
+        # Older callers may supply a short/custom key, so a row belonging to a
+        # different Case or capability must never be returned merely because
+        # it happens to occupy that key.  Derive a stable namespace escape for
+        # the requested identity; retries then converge on the same successor.
+        requested_payload = dict(payload or {})
+        requested_case = conn.execute(
+            "SELECT id FROM case_entity WHERE id=?", (case_id,)
+        ).fetchone()
+        if requested_case is None:
+            raise ValueError(f"Case not found: {case_id}")
         while True:
             existing = conn.execute(
-                "SELECT id, status FROM human_task WHERE idempotency_key=?", (key,)
+                "SELECT id, case_entity_id, type, status, payload FROM human_task "
+                "WHERE idempotency_key=?", (key,)
             ).fetchone()
             if existing is None:
                 break
-            if existing["status"] != "CANCELLED":
-                return existing["id"]
-            previous = existing["id"]
-            key = hashlib.sha256(f"{key}:after-cancellation:{previous}".encode()).hexdigest()
+            same_request = (existing["case_entity_id"] == case_id
+                            and existing["type"] == task_type)
+            malformed_existing = False
+            if existing["payload"]:
+                try:
+                    decoded_existing = json.loads(existing["payload"])
+                    malformed_existing = not isinstance(decoded_existing, dict)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    malformed_existing = True
+            if same_request and not malformed_existing:
+                if existing["status"] != "CANCELLED":
+                    return existing["id"]
+                previous = existing["id"]
+                key = hashlib.sha256(
+                    f"{key}:after-cancellation:{previous}".encode()
+                ).hexdigest()
+            else:
+                # Do not use the occupying row id: a deterministic derivation
+                # from the requested identity is what makes concurrent retries
+                # converge even when the foreign row is later removed.
+                material = json.dumps(requested_payload, sort_keys=True,
+                                      separators=(",", ":"))
+                key = hashlib.sha256(
+                    f"{key}:foreign:{case_id}:{task_type}:{material}".encode()
+                ).hexdigest()
         task_id = uuid.uuid4().hex
         now = utcnow()
         stored_payload = dict(payload)
@@ -62,6 +95,26 @@ def task_key(case_id, task_type, payload):
     """Immutable request identity, also usable to verify a damaged legacy payload."""
     material = f"{case_id}:{task_type}:{json.dumps(payload, sort_keys=True)}"
     return hashlib.sha256(material.encode()).hexdigest()
+
+
+def _decode_payload(raw):
+    """Decode coordination JSON without allowing one damaged row to break reads.
+
+    Payloads are coordination metadata, not authoritative evidence.  A
+    malformed legacy payload is therefore exposed as ``None`` with an
+    explicit diagnostic rather than being silently repaired or treated as an
+    empty request.  Evaluation will reject/replace it from the current
+    evidence basis.
+    """
+    if raw is None:
+        return None, None
+    try:
+        value = json.loads(raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None, "malformed task payload"
+    if not isinstance(value, dict):
+        return None, "task payload is not an object"
+    return value, None
 
 
 def get_human_task(conn, task_id: str) -> Optional[dict]:
@@ -82,7 +135,9 @@ def get_human_task(conn, task_id: str) -> Optional[dict]:
         task = dict(row)
         # Rename case_entity_id to case_id for compatibility
         task["case_id"] = task.pop("case_entity_id")
-        task["payload"] = json.loads(task["payload"]) if task["payload"] else None
+        task["payload"], payload_error = _decode_payload(task["payload"])
+        if payload_error:
+            task["payload_error"] = payload_error
         return task
     return None
 
@@ -107,7 +162,9 @@ def get_tasks_for_case(conn, case_id: str) -> List[dict]:
         task = dict(row)
         # Rename case_entity_id to case_id for compatibility
         task["case_id"] = task.pop("case_entity_id")
-        task["payload"] = json.loads(task["payload"]) if task["payload"] else None
+        task["payload"], payload_error = _decode_payload(task["payload"])
+        if payload_error:
+            task["payload_error"] = payload_error
         tasks.append(task)
     return tasks
 
@@ -172,7 +229,9 @@ def get_pending_tasks(conn, *, include_in_progress: bool = False) -> List[dict]:
     tasks = []
     for row in rows:
         task = dict(row)
-        task["payload"] = json.loads(task["payload"]) if task["payload"] else None
+        task["payload"], payload_error = _decode_payload(task["payload"])
+        if payload_error:
+            task["payload_error"] = payload_error
         tasks.append(task)
     return tasks
 

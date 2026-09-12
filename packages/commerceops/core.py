@@ -444,19 +444,34 @@ def import_source(conn: sqlite3.Connection, text: str, source_label: str = None)
                     quarantined += 1
                 else:
                     cancel_reason = our_remark if mapped_kind == "cancel_decided" else None
-                    st_ek = f"status:{_event_key(tno, mapped_kind, legacy_status, None)}"
-                    try:
+                    if mapped_kind == "cancel_decided" and not (cancel_reason or "").strip():
+                        # Legacy CANCEL is not proof of a valid human
+                        # cancellation. Preserve the raw line and require a
+                        # later explicit operator decision; never manufacture
+                        # terminal evidence from an invalid import row.
                         conn.execute(
-                            "INSERT INTO operator_action (id, shipment_id, kind, note, cancel_reason, actor, acted_at)"
-                            " VALUES (?,?,?,?,?,?,?)",
+                            "INSERT INTO quarantine_row (id, batch_id, line_no, line_text, reason) VALUES (?,?,?,?,?)",
                             (
-                                hashlib.sha256(f"act:{st_ek}".encode()).hexdigest()[:32],
-                                sid_new, mapped_kind, None, cancel_reason, "laiba", imported_at,
+                                hashlib.sha256(f"{batch_id}:{row['line_no']}:cancel-reason".encode()).hexdigest()[:32],
+                                batch_id, row["line_no"], rows_raw.get(row["line_no"], ""),
+                                "cancel status requires a non-empty cancellation reason",
                             ),
                         )
-                        actions_created += 1
-                    except sqlite3.IntegrityError:
-                        pass  # idempotent
+                        quarantined += 1
+                    else:
+                        st_ek = f"status:{_event_key(tno, mapped_kind, legacy_status, None)}"
+                        try:
+                            conn.execute(
+                                "INSERT INTO operator_action (id, shipment_id, kind, note, cancel_reason, actor, acted_at)"
+                                " VALUES (?,?,?,?,?,?,?)",
+                                (
+                                    hashlib.sha256(f"act:{st_ek}".encode()).hexdigest()[:32],
+                                    sid_new, mapped_kind, None, cancel_reason, "laiba", imported_at,
+                                ),
+                            )
+                            actions_created += 1
+                        except sqlite3.IntegrityError:
+                            pass  # idempotent
 
             refresh_state(conn, sid_new)
 

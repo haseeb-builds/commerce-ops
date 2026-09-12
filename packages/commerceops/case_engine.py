@@ -81,11 +81,23 @@ def assess_case(conn: sqlite3.Connection, case_id: str):
     evidence = _gather_evidence(conn, shipment_id)
     tasks = human_task.get_tasks_for_case(conn, case_id)
     follow_up_rows = followups.list_follow_ups(conn, shipment_id=shipment_id)
+    raw_resolution = case_obj["resolution"]
+    resolution = None
+    if raw_resolution:
+        try:
+            resolution = json.loads(raw_resolution)
+            if not isinstance(resolution, dict):
+                raise ValueError("resolution is not an object")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            # Coordination metadata is not authoritative evidence. Keep reads
+            # usable and let policy fail closed rather than crashing on one
+            # damaged historical row.
+            resolution = None
     coordination = policy.CoordinationState(
         case_id=case_id, shipment_id=shipment_id, status=case_obj["status"],
         opened_at=case_obj["opened_at"], updated_at=case_obj["updated_at"],
         latest_evidence_at=case_obj["latest_evidence_at"],
-        resolution=json.loads(case_obj["resolution"]) if case_obj["resolution"] else None,
+        resolution=resolution,
         policy_version=case_obj["policy_version"], human_tasks=tasks,
         autonomous_actions=autonomous_action.get_actions_for_case(conn, case_id),
         follow_ups=follow_up_rows["open"] + follow_up_rows["closed"],
@@ -100,16 +112,29 @@ def task_matches_work(task: dict, assessment: dict) -> bool:
     if (assessment["disposition"] != "HUMAN_TASK_REQUIRED"
             or task["type"] != assessment["capability"]):
         return False
-    basis = (task["payload"] or {}).get("evidence_ids")
-    return (isinstance(basis, list) and bool(basis)
+    payload = task["payload"] or {}
+    basis = payload.get("evidence_ids")
+    refs = payload.get("evidence_refs")
+    if not (isinstance(basis, list) and bool(basis)
             and all(isinstance(eid, str) for eid in basis)
-            and sorted(basis) == assessment["work_evidence_ids"]
-            and task["payload"].get("requirement_scope") == assessment.get("requirement_scope"))
+            and sorted(basis) == assessment["work_evidence_ids"]):
+        return False
+    # New work must bind source-qualified references.  The compatibility
+    # fallback is only for old rows that are provably recovered by the
+    # immutable request hash during reconciliation.
+    if "evidence_refs" in payload and (
+            not isinstance(refs, list)
+            or sorted(refs) != assessment.get("work_evidence_refs", [])):
+        return False
+    return payload.get("requirement_scope") == assessment.get("requirement_scope")
 
 
 def work_payload(assessment):
-    """Only evidence references and, after reopening, the lifecycle audit ID."""
-    payload = {"evidence_ids": assessment["work_evidence_ids"]}
+    """Evidence IDs plus source-qualified refs and lifecycle scope."""
+    payload = {
+        "evidence_ids": assessment["work_evidence_ids"],
+        "evidence_refs": assessment.get("work_evidence_refs", []),
+    }
     if assessment.get("requirement_scope"):
         payload["requirement_scope"] = assessment["requirement_scope"]
     return payload

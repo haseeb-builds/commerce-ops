@@ -86,6 +86,11 @@ def evaluate_policy(evidence: List[Evidence], coordination: CoordinationState) -
             "reason": reason,
             "evidence_ids": sorted(e.id for e in evidence),
             "work_evidence_ids": sorted(e.id for e in basis),
+            # IDs are retained for API compatibility, but task identity also
+            # carries the authoritative source.  A courier row and a customer
+            # row must not become interchangeable merely because a damaged or
+            # imported database reused an ID.
+            "work_evidence_refs": sorted(f"{e.type}:{e.id}" for e in basis),
             "policy_version": coordination.policy_version,
             "retire_work": retire_work,
             "reopen_case": reopen,

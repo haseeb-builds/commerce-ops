@@ -136,9 +136,23 @@ def evidence_boundary(conn, obj):
 
 
 def get_case_history(conn, case_id):
-    """Read-only lifecycle audit, including prior resolution payloads."""
+    """Read-only lifecycle audit, including prior resolution payloads.
+
+    Resolution is coordination metadata. Preserve a damaged historical value
+    as visible uncertainty instead of making detail/history reads fail.
+    """
     rows = conn.execute("SELECT * FROM case_status_event WHERE case_entity_id=? ORDER BY rowid", (case_id,))
-    return [{**dict(row), "resolution": json.loads(row["resolution"]) if row["resolution"] else None} for row in rows]
+    history = []
+    for row in rows:
+        item = dict(row)
+        raw = item.get("resolution")
+        try:
+            item["resolution"] = json.loads(raw) if raw else None
+        except (TypeError, ValueError, json.JSONDecodeError):
+            item["resolution"] = None
+            item["resolution_error"] = "malformed lifecycle resolution"
+        history.append(item)
+    return history
 
 
 def update_case_latest_evidence(conn, case_id: str, timestamp: str) -> None:
